@@ -1,0 +1,70 @@
+# Cursor Rules
+
+## Read First
+Before starting any task, read:
+- `.agent/lessons.md` — hard-won lessons from past sessions
+- `.agent/session-handoff.md` — context from the last session
+- `docs/ARCHITECTURE.md` — system architecture (if it exists)
+
+## Git Rules (Non-Negotiable)
+- NEVER commit to `main` or `master`. Always use feature branches.
+- Branch naming: `<type>/<short-description>` (feat/, fix/, refactor/, chore/, docs/, test/)
+- Conventional commits: `type(scope): description`
+- Atomic commits — one logical change each.
+- Run tests and linting before pushing.
+- Never commit secrets, tokens, or credentials.
+- Never force-push to shared branches.
+- Never disable tests to make them pass.
+
+## Team Protocol (if `.agent/team/` exists)
+- On startup: read `.agent/team/` files (registry, board, messages, locks). Register if not already. Update heartbeat.
+- Agent ID format: `<tool>-<n>` (e.g., `claude-1`, `cursor-2`)
+- Branch naming in team mode: `<type>/<agent-id>/<description>` (e.g., `feat/claude-1/auth-flow`)
+- Before starting work: sync team files, check board for tasks, check locks for conflicts, claim task and acquire locks, post a message.
+- During work: update heartbeat each commit, respect locks, coordinate via messages if you need locked files.
+- Advisory locks: check `.agent/team/locks.md` before modifying files. Don't touch paths locked by active agents.
+- Conflict resolution: post a message and coordinate — never force-resolve conflicts with other agents.
+- Session end: release locks, update board, move to Inactive in registry, post summary message, write handoff.
+- Stale agents (heartbeat >30 min): any agent may clean up their locks, release their tasks, move to Inactive.
+- Team commands: `/team-join`, `/team-status`, `/team-claim`, `/team-sync`, `/team-handoff`
+
+## Autonomy Model
+PROCEED autonomously if work is reversible: new files, new branches, additive changes, running tests.
+ASK PERMISSION (with context + risks) for: operations on main, deleting pre-existing files, modifying CI/CD, changing env vars, DB migrations, external API calls with side effects, installing production deps.
+Format permission requests as:
+```
+⚠️ PERMISSION REQUIRED
+Action: [what]
+Why: [reason]
+Risk: [what could go wrong]
+Reversible: [yes/no]
+```
+
+## Task Pattern
+1. Understand — read code and context before acting
+2. Plan — state approach before coding; write `.agent/current-plan.md` for complex tasks
+3. Implement — on a feature branch, atomic commits
+4. Verify — run tests, review your own diff
+5. Document — update relevant docs and inline comments (explain *why*, not *what*)
+6. Handoff — update `.agent/session-handoff.md` at end of session
+
+## Documentation
+- Update README.md if you change setup/run/deploy steps
+- Update docs/ARCHITECTURE.md if you add/change major components
+- Fix stale docs when you find them
+- At END of every session, update `.agent/session-handoff.md` with: what was done, current state (branch, tests, build), what's next, open questions, gotchas
+
+## Learning
+When something goes wrong, append to `.agent/lessons.md`:
+- What happened
+- Root cause
+- What should have been done
+- A concrete rule to prevent recurrence
+
+## Error Recovery
+1. Stop — don't compound errors
+2. Assess blast radius
+3. Revert to known good state if possible
+4. Inform user if break affects anything outside your branch
+5. Document in lessons.md
+6. Fix with clear root cause understanding
