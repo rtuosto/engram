@@ -10,4 +10,15 @@ Four modules with strict boundaries (see ``docs/DESIGN-MANIFESTO.md §6``):
 Only :class:`engram.MemorySystem` is the public surface benchmarks touch.
 """
 
+from engram.memory_system import MemorySystem
+from engram.models import AnswerResult, RetrievedNode, Session, Turn
+
+__all__ = [
+    "AnswerResult",
+    "MemorySystem",
+    "RetrievedNode",
+    "Session",
+    "Turn",
+]
+
 __version__ = "0.0.1"
