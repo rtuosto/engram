@@ -33,6 +33,7 @@ class FakeToken:
     pos_: str = ""
     dep_: str = ""
     label_: str = ""
+    is_stop: bool = False
     morph: FakeMorph = field(default_factory=FakeMorph)
     children: tuple[FakeToken, ...] = ()
     # subtree defaults to [self]; tests that care supply it explicitly.
@@ -64,12 +65,29 @@ class FakeSent:
 
 
 @dataclass
+class FakeNounChunk:
+    """Stand-in for a spaCy ``Span`` (``doc.noun_chunks`` item).
+
+    The n-gram extractor touches ``text``, ``start_char``, ``end_char``, and
+    iterates over the chunk's tokens via a ``tokens`` attribute (real Span
+    supports direct iteration; the extractor falls back to ``iter()`` for
+    that, so either works).
+    """
+
+    text: str
+    start_char: int
+    end_char: int
+    tokens: tuple[FakeToken, ...] = ()
+
+
+@dataclass
 class FakeDoc:
     """Minimal stand-in for :class:`spacy.tokens.Doc`."""
 
     text: str = ""
     sents: tuple[FakeSent, ...] = ()
     ents: tuple[FakeEnt, ...] = ()
+    noun_chunks: tuple[FakeNounChunk, ...] = ()
 
 
 def make_token(
@@ -80,6 +98,7 @@ def make_token(
     dep: str = "",
     lemma: str | None = None,
     tense: tuple[str, ...] = (),
+    is_stop: bool = False,
     children: Iterable[FakeToken] = (),
 ) -> FakeToken:
     children_tup = tuple(children)
@@ -89,6 +108,7 @@ def make_token(
         lemma_=(lemma if lemma is not None else text).casefold(),
         pos_=pos,
         dep_=dep,
+        is_stop=is_stop,
         morph=FakeMorph(tense=tense),
         children=children_tup,
     )
@@ -105,8 +125,14 @@ def make_fake_doc(
     text: str,
     sents: Iterable[FakeSent] = (),
     ents: Iterable[FakeEnt] = (),
+    noun_chunks: Iterable[FakeNounChunk] = (),
 ) -> FakeDoc:
-    return FakeDoc(text=text, sents=tuple(sents), ents=tuple(ents))
+    return FakeDoc(
+        text=text,
+        sents=tuple(sents),
+        ents=tuple(ents),
+        noun_chunks=tuple(noun_chunks),
+    )
 
 
 def deterministic_embed(dim: int = 16):
@@ -162,6 +188,7 @@ __all__ = [
     "FakeDoc",
     "FakeEnt",
     "FakeMorph",
+    "FakeNounChunk",
     "FakeSent",
     "FakeToken",
     "attach_subtree",

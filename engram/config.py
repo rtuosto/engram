@@ -47,6 +47,7 @@ class MemoryConfig:
     canonicalization_match_threshold: float = 0.85
     preference_discrimination_margin: float = 0.05
     claim_subject_required: bool = True
+    ngram_min_tokens: int = 2
     random_seed: int = 0
 
     # --- Answer fields ----------------------------------------------------
@@ -64,6 +65,7 @@ class MemoryConfig:
         "canonicalization_match_threshold",
         "preference_discrimination_margin",
         "claim_subject_required",
+        "ngram_min_tokens",
         "random_seed",
     })
     _ANSWER_FIELDS: ClassVar[frozenset[str]] = frozenset({

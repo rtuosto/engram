@@ -4,10 +4,11 @@ Pipeline order (``docs/design/ingestion.md §6``):
 
 1. Memory + Turn granule
 2. Sentence segmentation
-3. NER
-4. Entity canonicalization
-5. Claim extraction
-6. Preference detection (fails closed per polarity gate)
+3. N-gram extraction (noun_chunk + SVO)
+4. NER
+5. Entity canonicalization
+6. Claim extraction
+7. Preference detection (fails closed per polarity gate)
 
 Per-instance state (:class:`InstanceState`) owns the GraphStore and the
 working caches (EntityRegistry, monotonic ``memory_index``, speaker Entity
@@ -47,6 +48,10 @@ from engram.ingestion.extractors.claim import (
     extract_claims_from_sentence,
 )
 from engram.ingestion.extractors.ner import EntityMention, extract_mentions
+from engram.ingestion.extractors.ngram import (
+    extract_noun_chunk_ngrams,
+    extract_svo_ngrams,
+)
 from engram.ingestion.extractors.preference import (
     build_preference_payload,
     classify,
@@ -62,17 +67,22 @@ from engram.ingestion.schema import (
     LABEL_CLAIM,
     LABEL_ENTITY,
     LABEL_MEMORY,
+    LABEL_NGRAM,
     LABEL_PREFERENCE,
     LABEL_TURN,
     LABEL_UTTERANCE_SEGMENT,
+    LAYER_ENTITY,
+    LAYER_RELATIONSHIP,
     ClaimPayload,
     EdgeAttrs,
     EntityPayload,
     MemoryPayload,
+    NgramPayload,
     TurnPayload,
     entity_identity,
     memory_identity,
     node_id,
+    segment_identity,
     turn_identity,
 )
 from engram.models import Memory
@@ -98,6 +108,20 @@ class InstanceState:
 
 
 @dataclass(frozen=True, slots=True)
+class _SegmentInfo:
+    """Per-Sentence context passed to downstream stages.
+
+    ``sent`` is the spaCy sentence span (or :class:`tests._fake_nlp.FakeSent`
+    in tests); we keep a reference instead of re-iterating ``doc.sents`` to
+    avoid double-filtering empty sentences across stages.
+    """
+
+    segment_id: str
+    char_span: tuple[int, int]
+    sent: object
+
+
+@dataclass(frozen=True, slots=True)
 class _MemoryWork:
     """Intermediate per-Memory bundle. Internal; not persisted."""
 
@@ -106,6 +130,7 @@ class _MemoryWork:
     mentions: tuple[EntityMention, ...]
     entity_id_by_span: dict[tuple[int, int], str]
     speaker_entity_id: str
+    segments: tuple[_SegmentInfo, ...]
 
 
 class IngestionPipeline:
@@ -159,12 +184,15 @@ class IngestionPipeline:
         doc = docs[0]
 
         # [3] Segmentation.
-        self._emit_segments(state, turn_id, doc, memory_id=memory_id)
+        segments = self._emit_segments(state, turn_id, doc, memory_id=memory_id)
 
-        # [4] NER.
+        # [4] N-gram extraction (noun_chunk + SVO).
+        self._emit_ngrams(state, doc, segments, memory_id=memory_id)
+
+        # [5] NER.
         mentions = extract_mentions(doc, turn_id)
 
-        # [5] Entity canonicalization + mentions edges.
+        # [6] Entity canonicalization + mentions edges.
         entity_id_by_span: dict[tuple[int, int], str] = {}
         for mention in mentions:
             entity_id = self._canonicalize_and_link_mention(
@@ -181,11 +209,12 @@ class IngestionPipeline:
             mentions=tuple(mentions),
             entity_id_by_span=entity_id_by_span,
             speaker_entity_id=speaker_entity_id,
+            segments=tuple(segments),
         )
 
-        # [6] + [7] — claim extraction + preference detection per sentence.
+        # [7] + [8] — claim extraction + preference detection per sentence.
         self._extract_claims_and_preferences(
-            state, work, doc, asserted_at=memory.timestamp
+            state, work, asserted_at=memory.timestamp
         )
 
     # ------------------------------------------------------------------
@@ -243,7 +272,35 @@ class IngestionPipeline:
 
     def _emit_segments(
         self, state: InstanceState, turn_id: str, doc: object, *, memory_id: str
-    ) -> None:
+    ) -> list[_SegmentInfo]:
+        """Emit UtteranceSegment nodes; return per-sentence context for
+        downstream stages (n-gram extraction, claim / preference).
+
+        Iterates ``doc.sents`` once, skipping empty/whitespace-only sentences
+        in the same order :func:`segment_turn` does, and keeps a reference to
+        each live sentence span so subsequent stages don't need to re-filter.
+        """
+        segments: list[_SegmentInfo] = []
+        seg_index = 0
+        for sent in getattr(doc, "sents", ()):
+            text = str(getattr(sent, "text", "")).strip()
+            if not text:
+                continue
+            start = int(getattr(sent, "start_char", 0))
+            end = int(getattr(sent, "end_char", start + len(text)))
+            seg_id = node_id(segment_identity(turn_id, seg_index))
+            segments.append(
+                _SegmentInfo(
+                    segment_id=seg_id,
+                    char_span=(start, end),
+                    sent=sent,
+                )
+            )
+            seg_index += 1
+
+        # segment_turn() is re-used for its R2-sorted payload construction
+        # (char spans and segment_index match the sentences above because
+        # both iterators apply the same "strip empty" filter).
         for seg_id, payload in segment_turn(doc, turn_id):
             state.store.add_node(
                 seg_id,
@@ -258,6 +315,60 @@ class IngestionPipeline:
                     weight=1.0,
                     source_memory_id=memory_id,
                     source_turn_id=turn_id,
+                ),
+            )
+        return segments
+
+    def _emit_ngrams(
+        self,
+        state: InstanceState,
+        doc: object,
+        segments: list[_SegmentInfo],
+        *,
+        memory_id: str,
+    ) -> None:
+        """Emit N-gram nodes (noun chunks + SVO triples) with ``part_of``
+        edges to their containing Sentence granule.
+
+        Identity is ``(segment_id, ngram_kind, normalized_text)`` — an
+        observation of the same phrase from the same Sentence converges to
+        one node regardless of how many times the extractor visits it. N-gram
+        granules carry no layer label in PR-B (``semantic`` is implicit in
+        the parallel embedding index landing in PR-C).
+        """
+        if not segments:
+            return
+        min_tokens = self._config.ngram_min_tokens
+        segment_spans: list[tuple[tuple[int, int], str]] = [
+            (seg.char_span, seg.segment_id) for seg in segments
+        ]
+        noun_chunk_ngrams = extract_noun_chunk_ngrams(
+            doc, segment_spans, min_tokens=min_tokens
+        )
+        svo_ngrams: list[tuple[str, NgramPayload]] = []
+        for seg in segments:
+            svo_ngrams.extend(
+                extract_svo_ngrams(seg.sent, seg.segment_id, min_tokens=min_tokens)
+            )
+
+        all_ngrams = sorted(
+            noun_chunk_ngrams + svo_ngrams,
+            key=lambda pair: (pair[1].char_span, pair[1].ngram_kind, pair[1].normalized_text),
+        )
+        for ngram_id, payload in all_ngrams:
+            state.store.add_node(
+                ngram_id,
+                labels=frozenset({LABEL_NGRAM}),
+                payloads={LABEL_NGRAM: payload},
+            )
+            state.store.add_edge(
+                ngram_id,
+                payload.segment_id,
+                EdgeAttrs(
+                    type=EDGE_PART_OF,
+                    weight=1.0,
+                    source_memory_id=memory_id,
+                    source_turn_id=payload.segment_id,
                 ),
             )
 
@@ -279,6 +390,7 @@ class IngestionPipeline:
             entity_id,
             labels=frozenset({LABEL_ENTITY}),
             payloads={LABEL_ENTITY: payload},
+            layers=frozenset({LAYER_ENTITY}),
         )
         state.store.add_edge(
             turn_id,
@@ -306,6 +418,7 @@ class IngestionPipeline:
             entity_id,
             labels=frozenset({LABEL_ENTITY}),
             payloads={LABEL_ENTITY: payload},
+            layers=frozenset({LAYER_ENTITY}),
         )
         # Register so future NER mentions of the same speaker label resolve
         # to the same node deterministically.
@@ -317,7 +430,6 @@ class IngestionPipeline:
         self,
         state: InstanceState,
         work: _MemoryWork,
-        doc: object,
         *,
         asserted_at: str | None,
     ) -> None:
@@ -330,9 +442,9 @@ class IngestionPipeline:
             if (m.char_span[0], m.char_span[1]) in work.entity_id_by_span
         ]
 
-        for sent in getattr(doc, "sents", ()):
-            sent_start = int(getattr(sent, "start_char", 0))
-            sent_end = int(getattr(sent, "end_char", sent_start))
+        for seg in work.segments:
+            sent = seg.sent
+            sent_start, sent_end = seg.char_span
             sent_mentions = [
                 rm
                 for rm in resolved
@@ -370,6 +482,7 @@ class IngestionPipeline:
             claim_id,
             labels=frozenset({LABEL_CLAIM}),
             payloads={LABEL_CLAIM: claim_payload},
+            layers=frozenset({LAYER_RELATIONSHIP}),
         )
         state.store.add_edge(
             work.turn_id,
@@ -429,6 +542,7 @@ class IngestionPipeline:
             pref_id,
             labels=frozenset({LABEL_PREFERENCE}),
             payloads={LABEL_PREFERENCE: pref_payload},
+            layers=frozenset({LAYER_RELATIONSHIP}),
         )
         # Observation: holder Entity → Preference node.
         state.store.add_edge(
