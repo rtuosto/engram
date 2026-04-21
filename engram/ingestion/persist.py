@@ -30,6 +30,7 @@ from engram.ingestion.schema import (
     EpisodePayload,
     EventPayload,
     MemoryPayload,
+    NgramPayload,
     PreferencePayload,
     TurnPayload,
     UtteranceSegmentPayload,
@@ -45,6 +46,7 @@ _KIND_TO_CLS: Final[dict[str, type]] = {
     "memory": MemoryPayload,
     "turn": TurnPayload,
     "utterance_segment": UtteranceSegmentPayload,
+    "ngram": NgramPayload,
     "entity": EntityPayload,
     "claim": ClaimPayload,
     "preference": PreferencePayload,
@@ -209,9 +211,11 @@ def _decode_node_attrs(encoded: dict[str, Any]) -> dict[str, Any]:
     attrs: dict[str, Any] = {}
     for key, value in encoded.items():
         decoded = _decode_value(value)
-        if key == "labels":
+        if key in ("labels", "layers"):
             if not isinstance(decoded, list):
-                raise PersistFormatError(f"node labels must serialize as a list; got {type(decoded)}")
+                raise PersistFormatError(
+                    f"node {key} must serialize as a list; got {type(decoded)}"
+                )
             attrs[key] = frozenset(decoded)
         else:
             attrs[key] = decoded
@@ -258,10 +262,12 @@ def load_conversation(data: bytes) -> GraphStore:
         raw_attrs = entry["attrs"]
         attrs = _decode_node_attrs(raw_attrs)
         labels = attrs.pop("labels", frozenset())
+        layers = attrs.pop("layers", frozenset())
         payloads = {k: v for k, v in attrs.items() if k in labels}
-        # Any attrs keyed by a label name are payloads; others (future extension)
-        # would be added here. For SCHEMA_VERSION=1 no other attrs exist.
-        store.add_node(node_id, labels=labels, payloads=payloads)
+        # Any attrs keyed by a label name are payloads. Older files without
+        # a ``layers`` key default to an empty frozenset — forward-compatible
+        # with pre-PR-B dumps until we bump SCHEMA_VERSION in PR-C.
+        store.add_node(node_id, labels=labels, payloads=payloads, layers=layers)
 
     for entry in envelope.get("edges", []):
         attrs = _decode_value(entry["attrs"])

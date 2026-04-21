@@ -54,6 +54,7 @@ class GraphStore:
     _graph: nx.MultiDiGraph = field(default_factory=nx.MultiDiGraph)
     _frozen: bool = False
     _labels_index: dict[str, set[str]] = field(default_factory=dict)
+    _layers_index: dict[str, set[str]] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # State
@@ -82,15 +83,24 @@ class GraphStore:
         *,
         labels: frozenset[str],
         payloads: dict[str, object] | None = None,
+        layers: frozenset[str] = frozenset(),
     ) -> None:
         """Add or extend a node.
 
-        If the node already exists, ``labels`` is unioned with the existing
-        label set and each payload in ``payloads`` is attached under its
-        label-name key (overwriting any prior value for the same label).
+        If the node already exists, ``labels`` and ``layers`` are each
+        unioned with the existing sets and each payload in ``payloads`` is
+        attached under its label-name key (overwriting any prior value for
+        the same label).
 
         ``payloads`` is a ``{label: payload_dataclass}`` dict. Keys must all
         appear in ``labels`` (an unrelated payload key is a programming error).
+
+        ``layers`` is the content-classification layer set (see
+        ``docs/design/ingestion.md §3``: ``entity`` | ``relationship`` |
+        ``temporal`` | ``episodic``). ``semantic`` is *not* a layer label —
+        granules carry their semantic signal in the parallel embedding
+        index. Default ``frozenset()`` keeps non-classified granule nodes
+        valid.
         """
         self._require_writable()
         payloads = payloads or {}
@@ -108,12 +118,23 @@ class GraphStore:
                 self._graph.nodes[node_id][label] = payload
             for label in new_labels - existing_labels:
                 self._labels_index.setdefault(label, set()).add(node_id)
+
+            existing_layers: frozenset[str] = self._graph.nodes[node_id].get(
+                "layers", frozenset()
+            )
+            new_layers = existing_layers | layers
+            if new_layers != existing_layers:
+                self._graph.nodes[node_id]["layers"] = new_layers
+                for layer in new_layers - existing_layers:
+                    self._layers_index.setdefault(layer, set()).add(node_id)
         else:
-            attrs: dict[str, object] = {"labels": labels}
+            attrs: dict[str, object] = {"labels": labels, "layers": layers}
             attrs.update(payloads)
             self._graph.add_node(node_id, **attrs)
             for label in labels:
                 self._labels_index.setdefault(label, set()).add(node_id)
+            for layer in layers:
+                self._layers_index.setdefault(layer, set()).add(node_id)
 
     def add_edge(self, src: str, dst: str, attrs: EdgeAttrs) -> None:
         """Add a typed edge. Parallel edges of the same type are not allowed;
@@ -148,6 +169,23 @@ class GraphStore:
     def nodes_by_label(self, label: str) -> list[str]:
         """Sorted list of node IDs carrying ``label``."""
         return sorted(self._labels_index.get(label, set()))
+
+    def node_layers(self, node_id: str) -> frozenset[str]:
+        """Layer labels attached to ``node_id`` (``entity`` / ``relationship``
+        / ``temporal`` / ``episodic``). Empty frozenset for granule nodes and
+        Memories (``docs/design/ingestion.md §3``: ``semantic`` lives in the
+        parallel embedding index, not on the node)."""
+        if not self._graph.has_node(node_id):
+            raise NodeNotFoundError(node_id)
+        return self._graph.nodes[node_id].get("layers", frozenset())
+
+    def nodes_by_layer(self, layer: str) -> list[str]:
+        """Sorted list of node IDs carrying ``layer``.
+
+        Primary use site is recall (PR-E): intent-driven seeding and
+        expansion work against layer partitions, not raw node-type labels.
+        """
+        return sorted(self._layers_index.get(layer, set()))
 
     def has_edge(self, src: str, dst: str, edge_type: str) -> bool:
         return self._graph.has_edge(src, dst, key=edge_type)

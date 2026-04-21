@@ -5,6 +5,71 @@
 
 ---
 
+## Session: 2026-04-20 — PR-B (n-gram granularity + layer labels)
+
+### What Was Done
+
+Landed PR-B on `feat/pr-b-ngram-layers`. Patches 3 + 5 from `docs/design/ingestion.md §12`:
+
+**Patch 3 — n-gram granularity.**
+- New `engram/ingestion/extractors/ngram.py` with two deterministic extractors:
+  - `extract_noun_chunk_ngrams(doc, segment_spans, *, min_tokens)` — walks spaCy `doc.noun_chunks`, maps each chunk to its enclosing Sentence, drops all-stop-word / below-min-tokens surfaces (fails closed, R6-style).
+  - `extract_svo_ngrams(sent, segment_id, *, min_tokens)` — per-sentence dep-parse SVO triple (nsubj/nsubjpass + root verb + dobj/attr, with prep→pobj fallback).
+- New `NgramPayload` dataclass and `ngram_identity(segment_id, ngram_kind, normalized_text)` helper. Content-addressed by that triple — two sentences sharing a phrase produce two nodes (each granule carries its own `part_of` edge and eventually its own embedding in PR-C), while two visits to the same phrase within one Sentence converge.
+- `LABEL_NGRAM` added; registered in `persist._KIND_TO_CLS` (schema-version stays at 1 — the payload dict is additive and doesn't require a bump).
+- Pipeline stage [3] runs both extractors, emits N-gram nodes + `part_of` (N-gram → Sentence) edges. Output is sorted by `(char_span, ngram_kind, normalized_text)` so pipeline iteration order is R2-stable.
+- New `MemoryConfig.ngram_min_tokens = 2` (provisional, calibration deferred) — categorized under `_INGESTION_FIELDS` so the fingerprint-discipline test covers it.
+
+**Patch 5 — layer labels.**
+- `GraphStore.add_node(..., layers: frozenset[str] = frozenset())` accepts a content-classification layer set; second call unions layers.
+- `GraphStore.node_layers(node_id)` + `GraphStore.nodes_by_layer(layer)` read helpers (R2-sorted).
+- Pipeline populates layers:
+  - Entity nodes → `{entity}` (includes speaker entities).
+  - Claim nodes → `{relationship}`.
+  - Preference nodes → `{relationship}`.
+- Granule nodes (Memory / Turn / UtteranceSegment / N-gram) carry empty `frozenset()` — per design, `semantic` is implicit in the parallel embedding index (landing PR-C), not a node label. Temporal / episodic layers land in PR-D.
+- `persist.py` loader now handles the new `layers` node attr (missing = empty frozenset, forward-compatible with pre-PR-B dumps).
+
+**Shared-iteration refactor.** The pipeline used to re-iterate `doc.sents` in segmentation, n-gram, and claim/preference stages — three places that had to agree on the "skip empty" filter. Consolidated to one iteration in `_emit_segments`, which now returns a `list[_SegmentInfo]` carrying `(segment_id, char_span, sent)` for downstream stages. Prevents the drift bug where two stages disagree about sentence boundaries.
+
+**Tests.** Two new test files:
+- `tests/test_ngram_extractor.py` — 14 per-extractor units (identity, sorting, content-address, min-tokens gate, span/segment resolution, fail-closed paths).
+- `tests/test_layers.py` — 9 tests covering GraphStore layer discipline (default empty, index, union-on-repeat, missing-node error) and pipeline integration (entity/claim/preference layered correctly, granules leave layers empty, n-gram nodes + part_of edges present).
+
+Test suite: 123 passing (was 98 on PR-A); ruff clean; mypy down from 19 → 16 errors (my changes introduced zero new errors).
+
+### Current State
+
+- Branch: `feat/pr-b-ngram-layers` (open; not yet PR'd against main)
+- `main` at `c4e2ddb` — PR-A merged
+- Tests: 123 passing, ruff clean, mypy 16 pre-existing errors (unchanged touch)
+- Build: `pip install -e .` unchanged
+- `SCHEMA_VERSION` still at `1` — on-disk dataclass registry gained `NgramPayload`, but existing files decode because no required fields changed. PR-C will bump to `2` when it adds the parallel vector index.
+
+### What's Next
+
+**Immediate:** open PR-B → main → merge.
+
+Then proceed through the roadmap in `.agent/current-plan.md`:
+
+1. ~~**PR-B** — n-gram granularity + layer labels.~~ (this session)
+2. **PR-C** — granule embeddings + parallel vector index + `dump_state`/`load_state` rename + `SCHEMA_VERSION` bump to 2.
+3. **PR-D** — TimeAnchor + derived-rebuild orchestrator.
+4. **PR-E** — recall implementation (greenfield `engram/recall/`).
+
+### Open Questions
+
+- N-gram identity includes `segment_id`, so a phrase repeated across sentences creates distinct nodes. Recall's cross-sentence connection will have to happen through Entity nodes (already shared) or the co-occurrence derived index (PR-D). No blocker; flagging for PR-E's seeding design.
+- N-gram embeddings aren't computed yet — PR-C adds them. Until then, granules have no vector representation and recall cannot use the semantic-layer index.
+
+### Gotchas
+
+- The pipeline ingest order now runs n-gram extraction right after segmentation and before NER (so the n-gram stage sees the full Doc and the live segment spans). The stage-numbered code comments in `pipeline.py` reflect the new order; the module docstring lists stages as a bullet list without absolute indexes.
+- `FakeDoc.noun_chunks` now exists as an optional field; existing tests don't pass it and default to empty tuple → noun-chunk extractor returns nothing. Tests that care must construct `FakeNounChunk` instances (see `tests/test_ngram_extractor.py` for patterns).
+- `FakeToken.is_stop = False` default. Tests exercising the min-tokens gate must set `is_stop=True` on tokens meant to be filtered out.
+
+---
+
 ## Session: 2026-04-20 — PR-A (protocol pivot + R16 primary-data discipline)
 
 ### What Was Done

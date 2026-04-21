@@ -33,6 +33,7 @@ from typing import Final
 LABEL_MEMORY: Final[str] = "memory"
 LABEL_TURN: Final[str] = "turn"
 LABEL_UTTERANCE_SEGMENT: Final[str] = "utterance_segment"
+LABEL_NGRAM: Final[str] = "ngram"
 LABEL_ENTITY: Final[str] = "entity"
 LABEL_CLAIM: Final[str] = "claim"
 LABEL_PREFERENCE: Final[str] = "preference"
@@ -43,11 +44,48 @@ ALL_NODE_LABELS: Final[frozenset[str]] = frozenset({
     LABEL_MEMORY,
     LABEL_TURN,
     LABEL_UTTERANCE_SEGMENT,
+    LABEL_NGRAM,
     LABEL_ENTITY,
     LABEL_CLAIM,
     LABEL_PREFERENCE,
     LABEL_EVENT,
     LABEL_EPISODE,
+})
+
+# ---------------------------------------------------------------------------
+# Layer labels — content-classification labels on nodes (§3).
+#
+# ``semantic`` is deliberately *not* a node label: it lives in the parallel
+# granule embedding store (PR-C), not on the graph node. Granules (Memory /
+# Turn / UtteranceSegment / N-gram) therefore carry an empty ``layers`` set
+# in PR-B; Entity / Claim / Preference carry their classification label.
+# ---------------------------------------------------------------------------
+
+LAYER_ENTITY: Final[str] = "entity"
+LAYER_RELATIONSHIP: Final[str] = "relationship"
+LAYER_TEMPORAL: Final[str] = "temporal"
+LAYER_EPISODIC: Final[str] = "episodic"
+
+ALL_LAYER_LABELS: Final[frozenset[str]] = frozenset({
+    LAYER_ENTITY,
+    LAYER_RELATIONSHIP,
+    LAYER_TEMPORAL,
+    LAYER_EPISODIC,
+})
+
+# ---------------------------------------------------------------------------
+# N-gram kinds — one string per extractor that emits n-grams. Feeds the
+# N-gram node's identity so two extractors emitting the same phrase from
+# the same Sentence produce distinct nodes (they are distinct observations
+# about that phrase, coming from different parses).
+# ---------------------------------------------------------------------------
+
+NGRAM_KIND_NOUN_CHUNK: Final[str] = "noun_chunk"
+NGRAM_KIND_SVO: Final[str] = "svo"
+
+ALL_NGRAM_KINDS: Final[frozenset[str]] = frozenset({
+    NGRAM_KIND_NOUN_CHUNK,
+    NGRAM_KIND_SVO,
 })
 
 # ---------------------------------------------------------------------------
@@ -162,6 +200,24 @@ class UtteranceSegmentPayload:
     text: str
     turn_id: str
     segment_index: int
+    char_span: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class NgramPayload:
+    """A key-phrase granule inside an UtteranceSegment (§3, §5).
+
+    Two extractors emit n-grams: noun chunks (``doc.noun_chunks``) and SVO
+    dependency subtrees (subject + root verb + object). ``ngram_kind``
+    distinguishes them; ``normalized_text`` is the R2-stable identity key
+    (lowercase NFKC); ``surface_form`` preserves the original casing for
+    recall-time display.
+    """
+
+    normalized_text: str
+    surface_form: str
+    segment_id: str
+    ngram_kind: str  # "noun_chunk" | "svo"
     char_span: tuple[int, int]
 
 
@@ -289,6 +345,22 @@ def segment_identity(turn_id: str, segment_index: int) -> dict[str, object]:
         "type": LABEL_UTTERANCE_SEGMENT,
         "turn_id": turn_id,
         "segment_index": segment_index,
+    }
+
+
+def ngram_identity(
+    segment_id: str, ngram_kind: str, normalized_text: str
+) -> dict[str, object]:
+    """N-gram identity — same normalized phrase + same kind + same Sentence
+    converges to one node. N-grams are scoped to their containing Sentence
+    so that otherwise-identical phrases in two Sentences are two distinct
+    granules (each with its own semantic embedding and ``part_of`` edge).
+    """
+    return {
+        "type": LABEL_NGRAM,
+        "segment_id": segment_id,
+        "ngram_kind": ngram_kind,
+        "normalized_text": normalized_text,
     }
 
 
