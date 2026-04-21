@@ -5,6 +5,92 @@
 
 ---
 
+## Session: 2026-04-21 — ingestion-perf Phase 1 + Phase 2
+
+### What Was Done
+
+Landed `perf/ingestion-speedup` — merged to main. Three commits:
+
+- **Phase 1** (`0335650`): per-stage ingestion profile harness
+  [`scripts/profile_ingestion.py`](../scripts/profile_ingestion.py). Wraps
+  the three injected model callables (spaCy, mpnet preference,
+  MiniLM granule) with `time.perf_counter()` timers before handing
+  them to `IngestionPipeline`. Emits a JSON artifact per commit
+  under `profiling/`. Supports `--cprofile` for drill-downs and
+  `--corpus longmemeval` as a best-effort loader.
+  Baseline `profiling/ingestion-c40d5bc.json` (main, 40-mem synthetic):
+  total 836ms, preference_embed 313.7ms (37.5%, 45 unbatched calls),
+  nlp 259ms, granule_embed 236.5ms.
+
+- **Phase 2** (`b325f53`): hoisted mpnet preference-classification
+  out of the per-sentence loop. New API
+  `engram.ingestion.extractors.preference.classify_batch(texts, ...)`;
+  `IngestionPipeline._extract_claims_and_preferences` now collects
+  `(claim_payload, sentence_text)` tuples while emitting Claim nodes
+  inline, then fires a single batched `preference_embed` call per
+  Memory. Per-row L2 normalization + centroid dots stay in a Python
+  loop so the scoring arithmetic is bit-identical to single-text
+  `classify()`.
+  Measured: mpnet **calls 45 → 30 (−33%)**, preference_embed
+  **−7.5%**. Total-time delta is inside run-to-run noise (±5%) on the
+  synthetic corpus because templates average only 1.5 claim events
+  per call-site. Real corpora with multi-claim memories will batch
+  more aggressively.
+
+- **Phase 2 fingerprint guard**
+  [`scripts/check_fingerprint_equivalence.py`](../scripts/check_fingerprint_equivalence.py).
+  First pass used a raw msgpack SHA-256 — flagged drift because
+  `holds_preference` edge weights moved ~5e-8 (batched vs singleton
+  encoder numerics from attention-mask padding). Graph topology is
+  byte-identical: same 271 nodes, same 539 edges, same 5 Preference
+  node IDs, same polarities, same claim identities. Upgraded the
+  guard to compare structure (node IDs, edge tuples, payloads exact;
+  edge weights within 1e-5). That is the correct R3/R4 proxy — "does
+  the ingested graph mean the same thing," not "do the bytes match
+  to the last ULP." Any new Preference, polarity flip, or payload
+  change still fails immediately.
+
+### cProfile-driven decisions (commit `8748597`)
+
+- **Phase 3 (VectorIndex amortized-O(1) append): DROPPED.**
+  `vector_index.add` = 6ms across 266 calls (1.7% of stage 8).
+  Plan's <5% threshold. The `np.vstack` pattern is still a textbook
+  anti-pattern; only revisit at benchmark scale (tens of thousands
+  of granules).
+- **Phase 4 (canonicalization index): DEFERRED.**
+  `canonicalize` = 1ms across 156 calls (0.4% of total ingest) on
+  the synthetic corpus. Revisit when a real LongMemEval-s run
+  produces hundreds of entities per instance.
+- **Phase 5 (batched `ingest_many` API): not started.** Largest
+  scope remaining. Would collapse stages 2+7+8 across multiple
+  memories into one forward pass each. Needs protocol extension.
+- **Phase 6 (model-load cache): not started.** 10s of model load
+  per pipeline construction. Low effort; useful for benchmark runs
+  that spawn multiple engram instances.
+
+### Current State
+
+- Branch: `perf/ingestion-speedup` merged into `main`.
+- Tests: all 258 passing.
+- Build: clean.
+
+### Gotchas
+
+- `sentence-transformers` batched forward passes produce float32
+  outputs that differ from singletons at the 7th–8th decimal. Any
+  future "batch more inputs" optimization must use the structural
+  fingerprint guard (not a raw byte hash) or it will appear to
+  regress R3/R4.
+- `profiling/` is tracked in-tree. Each phase's artifact is pinned
+  by commit SHA so regressions are a `diff` away.
+- `scripts/check_fingerprint_equivalence.py --emit` requires the
+  synthetic corpus from `scripts/profile_ingestion.py`; running it
+  against an older commit that lacks the profile harness needs a
+  self-contained re-implementation of the corpus (see the pattern
+  in `_tmp_baseline_hash.py` used during this session).
+
+---
+
 ## Session: 2026-04-20 — PR-F (diagnostics module skeleton)
 
 ### What Was Done

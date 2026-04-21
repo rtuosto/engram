@@ -57,8 +57,9 @@ from engram.ingestion.extractors.ngram import (
     extract_svo_ngrams,
 )
 from engram.ingestion.extractors.preference import (
+    PreferenceVerdict,
     build_preference_payload,
-    classify,
+    classify_batch,
 )
 from engram.ingestion.extractors.segmentation import segment_turn
 from engram.ingestion.graph import GraphStore
@@ -571,6 +572,13 @@ class IngestionPipeline:
         """Returns the list of Claim + Preference node IDs emitted on this
         ingest (de-duplicated in insertion order). Used by stage [9] to
         attach ``temporal_at`` edges to freshly observed relationships.
+
+        Preference classification is batched: all claim sentences for this
+        Memory are embedded in one ``preference_embed`` call. Persisted
+        output is byte-identical to the per-claim path because
+        ``dump_state`` sorts nodes by ``node_id`` and edges by ``(src, dst,
+        type)`` — insertion order of Claim and Preference nodes does not
+        affect the msgpack bytes (see persist.py:151,158).
         """
         resolved = [
             ResolvedMention(
@@ -590,6 +598,10 @@ class IngestionPipeline:
             seen.add(node_id_)
             emitted_ids.append(node_id_)
 
+        # Pass 1: emit Claim nodes/edges and collect the (claim, sentence_text)
+        # pairs that feed preference classification. Sentence text is the
+        # input to mpnet — same as the unbatched path.
+        pending_prefs: list[tuple[ClaimPayload, str]] = []
         for seg in work.segments:
             sent = seg.sent
             sent_start, sent_end = seg.char_span
@@ -610,15 +622,31 @@ class IngestionPipeline:
             for claim_id, claim_payload in claims:
                 self._emit_claim(state, work, claim_id, claim_payload, asserted_at=asserted_at)
                 _record(claim_id)
-                pref_id = self._maybe_emit_preference(
+                pending_prefs.append((claim_payload, sent_text))
+
+        # Pass 2: one batched preference-embed call for all collected claim
+        # sentences. Verdicts align positionally with pending_prefs.
+        if pending_prefs:
+            verdicts = classify_batch(
+                [text for _, text in pending_prefs],
+                self._centroids,
+                self._preference_embed,
+                margin_threshold=self._config.preference_discrimination_margin,
+                enabled_polarities=self._enabled_polarities,
+            )
+            for (claim_payload, _sent_text), verdict in zip(
+                pending_prefs, verdicts, strict=True
+            ):
+                if verdict is None:
+                    continue
+                pref_id = self._emit_preference_from_verdict(
                     state,
                     work,
+                    verdict=verdict,
                     claim_payload=claim_payload,
-                    sentence_text=sent_text,
                     asserted_at=asserted_at,
                 )
-                if pref_id is not None:
-                    _record(pref_id)
+                _record(pref_id)
         return emitted_ids
 
     def _emit_claim(
@@ -667,24 +695,15 @@ class IngestionPipeline:
                 ),
             )
 
-    def _maybe_emit_preference(
+    def _emit_preference_from_verdict(
         self,
         state: InstanceState,
         work: _MemoryWork,
         *,
+        verdict: PreferenceVerdict,
         claim_payload: ClaimPayload,
-        sentence_text: str,
         asserted_at: str | None,
-    ) -> str | None:
-        verdict = classify(
-            sentence_text,
-            self._centroids,
-            self._preference_embed,
-            margin_threshold=self._config.preference_discrimination_margin,
-            enabled_polarities=self._enabled_polarities,
-        )
-        if verdict is None:
-            return None
+    ) -> str:
         pref_id, pref_payload = build_preference_payload(
             verdict,
             claim_payload=claim_payload,
