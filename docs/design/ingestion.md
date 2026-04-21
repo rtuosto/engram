@@ -387,9 +387,20 @@ Three models feed ingestion; each is a `MemoryConfig._INGESTION_FIELDS` entry.
 |---|---|---|---|
 | NLP pipeline — segmentation, n-gram extraction, NER, dep parse, morph | `en_core_web_sm` | `spacy_model` | CPU-deterministic, ~12 MB, fast. Transformer variant deferred until NER quality is a diagnosed blocker. |
 | Granule embedding — semantic-layer indexing, claim / entity proximity | `all-MiniLM-L6-v2` | `embedding_model` | Predecessor default; 384-dim; well-characterized. Topical only — known to flatten speech acts (P5). |
-| Preference discrimination | `all-mpnet-base-v2` | `preference_embedding_model` | NLI-aware; discriminates assertion / negation / preference structure. 768-dim. |
+| Preference discrimination | `all-MiniLM-L6-v2` | `preference_embedding_model` | Same encoder as granule embedding. Matches `all-mpnet-base-v2` at 92.9% held-out accuracy (39/42), all six polarities clear the §5 discrimination gate, and preference embedding cost drops ~2× (≈8 ms → ≈4 ms per claim-bearing memory). See §8.1 for the reversion criteria. |
 
 Model swaps require an M1 hypothesis (target bucket, expected pp delta) and pass the K6 replicate gate. The fingerprint-discipline test catches forgotten categorizations automatically.
+
+### 8.1 Preference-encoder reversion criteria
+
+MiniLM replaces mpnet at `preference_embedding_model` as of 2026-04-21. The choice was a measurement tie on engram's own `preferences/heldout.json` (both models at 39/42 correct), not a reputation judgment. Revert to `all-mpnet-base-v2` if **any** of the following fire:
+
+- **Discrimination gate regression.** A future seed / held-out edit (invalidating `preference_seed_hash`) produces a polarity whose median margin falls below `preference_discrimination_margin` under MiniLM but clears under mpnet. The cheap test lives in the pipeline factory — watch for polarities dropping out of `enabled_polarities`.
+- **Failure-bucket diagnosis on LME-s points at preference extraction.** If `diagnostics.classify_failures` attributes a non-trivial share of `single-session-preference` misses to `extraction_miss` with near-threshold margins, mpnet's ~50–100% larger margins may recover them. Verify by A/B'ing the two models on the failing subset before committing.
+- **Per-polarity accuracy drift widens.** MiniLM's failures on the current held-out set are concentrated in `rejects` (71% vs mpnet's 86%). If a future held-out expansion reveals MiniLM trailing on one or two polarities by >10pp, the cheap fix is to revert; the better fix is a polarity-specific centroid calibration.
+- **Quantized-mpnet is ever added.** ONNX/quantized mpnet on CPU has historically closed most of the speed gap to MiniLM float32 while keeping mpnet's larger margins. If we build out a quantization layer for encoders, mpnet-quantized is preferable to MiniLM-float32 for this role.
+
+The fingerprint guard (`scripts/check_fingerprint_equivalence.py`) baseline was taken under mpnet — it must be re-emitted on the first commit after the swap; otherwise every structural-equivalence check on a downstream PR drifts against a stale baseline.
 
 ---
 

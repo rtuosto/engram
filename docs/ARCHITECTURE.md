@@ -96,13 +96,14 @@ Measurement against **LongMemEval-s** (primary) and **LOCOMO** (validation) live
 | Preference encoder is batched per-Memory (`classify_batch`) | mpnet is the dominant per-ingest cost; one forward pass per Memory beats one per sentence. Per-row scoring stays identical to `classify()` so the verdict is byte-stable. | 2026-04-21 |
 | Ingestion perf regressions are gated by structural fingerprint, not msgpack bytes | Batched transformer inference drifts at the 7th–8th float decimal. Same graph topology + same node IDs + edge weights within 1e-5 is the correct R3/R4 proxy. | 2026-04-21 |
 | `MemorySystem.ingest_many(memories)` batched variant (default: loop) | Pools spaCy + mpnet + MiniLM forward passes across the batch dimension for a 2.58× end-to-end speedup on 50-memory synthetic corpus. Per-memory graph writes + canonicalization stay sequential so R16 append-only ordering is preserved exactly; structural fingerprint guard confirms R3/R4 equivalence. | 2026-04-21 |
+| Preference encoder swapped from mpnet to MiniLM | Measured 39/42 (92.9%) accuracy tie on `preferences/heldout.json`; all six polarities clear the discrimination gate. ~2× faster at the preference stage (≈8 ms → ≈4 ms per claim-bearing memory). mpnet retains ~50–100% larger margins — documented reversion criteria in `docs/design/ingestion.md §8.1` (gate regression, LME preference-bucket diagnosis, polarity-specific accuracy drift, or arrival of quantized-mpnet). | 2026-04-21 |
 
 ## External Dependencies
 
 | Service | Purpose | Notes |
 |---------|---------|-------|
 | Ollama | The benchmark agent's answerer. **Not invoked from engram.** | `llama3.1:8b` is the canonical answerer; lives outside engram. |
-| Sentence-Transformers | Embeddings for granule semantic indexing and seeding | `all-MiniLM-L6-v2` for granule embeddings; `all-mpnet-base-v2` for preference centroids. |
+| Sentence-Transformers | Embeddings for granule semantic indexing and seeding | `all-MiniLM-L6-v2` for both granule embeddings and preference centroids. (Preference encoder swapped from `all-mpnet-base-v2` to MiniLM 2026-04-21 — measurement tie at 92.9% held-out accuracy, ~2× faster. See `docs/design/ingestion.md §8.1` for reversion criteria.) |
 | spaCy | Sentence splitting, n-gram extraction, NER, dependency parses | Enables no-LLM-at-ingest (R5) extraction |
 | rapidfuzz | String similarity for entity canonicalization | Fast, deterministic. |
 | networkx | In-memory `MultiDiGraph` storage | One graph per engram instance. |
