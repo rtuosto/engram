@@ -95,6 +95,7 @@ Measurement against **LongMemEval-s** (primary) and **LOCOMO** (validation) live
 | No reranker in recall v1 | Walk scores are legible and tunable; add a reranker only when diagnostics shows ranking quality is the bottleneck. | 2026-04-20 |
 | Preference encoder is batched per-Memory (`classify_batch`) | mpnet is the dominant per-ingest cost; one forward pass per Memory beats one per sentence. Per-row scoring stays identical to `classify()` so the verdict is byte-stable. | 2026-04-21 |
 | Ingestion perf regressions are gated by structural fingerprint, not msgpack bytes | Batched transformer inference drifts at the 7th–8th float decimal. Same graph topology + same node IDs + edge weights within 1e-5 is the correct R3/R4 proxy. | 2026-04-21 |
+| `MemorySystem.ingest_many(memories)` batched variant (default: loop) | Pools spaCy + mpnet + MiniLM forward passes across the batch dimension for a 2.58× end-to-end speedup on 50-memory synthetic corpus. Per-memory graph writes + canonicalization stay sequential so R16 append-only ordering is preserved exactly; structural fingerprint guard confirms R3/R4 equivalence. | 2026-04-21 |
 
 ## External Dependencies
 

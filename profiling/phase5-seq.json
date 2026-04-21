@@ -1,0 +1,48 @@
+{
+  "commit": "d224400",
+  "corpus": "synthetic",
+  "graph_totals": {
+    "n_claims": 9,
+    "n_edges": 1296,
+    "n_entities": 39,
+    "n_granules": 489,
+    "n_memories": 50,
+    "n_nodes": 592,
+    "n_preferences": 5,
+    "n_time_anchors": 50
+  },
+  "max_ingest_ms": 59.228,
+  "mean_ingest_ms": 20.068,
+  "memories": 50,
+  "model_load_s": 9.983,
+  "other_ms": 36.098,
+  "p50_ingest_ms": 19.332,
+  "p95_ingest_ms": 31.905,
+  "stages": {
+    "granule_embed": {
+      "calls": 50,
+      "items": 439,
+      "mean_ms_per_call": 6.081,
+      "mean_ms_per_item": 0.693,
+      "name": "granule_embed",
+      "total_ms": 304.074
+    },
+    "nlp_process": {
+      "calls": 50,
+      "items": 50,
+      "mean_ms_per_call": 6.829,
+      "mean_ms_per_item": 6.829,
+      "name": "nlp_process",
+      "total_ms": 341.462
+    },
+    "preference_embed": {
+      "calls": 37,
+      "items": 56,
+      "mean_ms_per_call": 8.697,
+      "mean_ms_per_item": 5.746,
+      "name": "preference_embed",
+      "total_ms": 321.776
+    }
+  },
+  "total_ingest_s": 1.003
+}

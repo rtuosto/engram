@@ -23,6 +23,7 @@ metadata but leaves cache key composition to the external benchmark harness.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -64,6 +65,25 @@ class MemorySystem(Protocol):
         identical internal state. Must not call an LLM (``R5``).
         """
         ...
+
+    async def ingest_many(self, memories: Iterable[Memory]) -> None:
+        """Append a sequence of :class:`Memory` observations in order.
+
+        Semantically equivalent to ``for m in memories: await ingest(m)`` —
+        same ``R2`` determinism, same ``R16`` append-only ordering. The
+        default implementation does exactly that; implementations MAY
+        override with a batched variant that pools model calls across the
+        batch dimension. Any override MUST produce a graph that is
+        structurally identical to the sequential path (same node IDs,
+        same edge tuples, same payloads) — numeric drift in edge weights
+        from batched transformer inference is tolerated within the
+        structural-fingerprint guard (``docs/ARCHITECTURE.md`` Key Decisions
+        2026-04-21; ``scripts/check_fingerprint_equivalence.py``).
+
+        Must not call an LLM (``R5``, ``R13``).
+        """
+        for memory in memories:
+            await self.ingest(memory)
 
     async def recall(
         self,
