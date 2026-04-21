@@ -5,6 +5,146 @@
 
 ---
 
+## Session: 2026-04-20 — PR-F (diagnostics module skeleton)
+
+### What Was Done
+
+Landed PR-F on `feat/pr-f-diagnostics`. Greenfield `engram/diagnostics/`
+per manifesto §6 — the third and final module in the `ingestion /
+recall / diagnostics` triad. Read-only (never writes caches, never
+mutates run artifacts); zero LLM calls (R5, R13).
+
+**Public verbs (five, per manifesto).**
+- `classify_failures(cases, store=None, *, partial_threshold=0.5)` —
+  R15 decision-tree classifier. Emits one `FailureCase` per
+  `FailureInput`; `FailureKind(StrEnum)` covers
+  `extraction_miss | graph_gap | retrieval_miss | partial_retrieval |
+  output_miss | agent_miss` plus a neutral `correct` bucket so
+  aggregation preserves denominators.
+- `bucket_breakdown(cases, *, bucket_key="bucket")` — per-bucket counts
+  per kind + totals + `total_cases` / `total_correct`. None-buckets
+  group under the literal `"(none)"` key.
+- `needle_overlap(gold, text)` — content-term overlap kernel
+  (NFKC casefold + ASCII tokenize + 3-char min + small stop-word list).
+  Returns sorted tuples for R2 stability.
+- `extraction_coverage(store)` — nodes-by-label, nodes-by-layer
+  (unlayered granules grouped under `(unlayered)`), ngram_kinds,
+  edges-by-type, and a totals map
+  (`n_nodes / n_edges / n_memories / n_entities / n_claims /
+  n_preferences / n_time_anchors / n_granules`).
+- `fingerprint_audit(a, b)` — full-field diff between two
+  `MemoryConfig` instances. Separate `ingestion_match` / `recall_match`
+  booleans + sorted `diverging_fields` tuple of `(name, value_a,
+  value_b)`.
+
+**R15 decision tree** (see `failures.py` docstring):
+1. Overlap(gold, passages) == 0
+   → extraction_miss if store also has zero node overlap
+   → graph_gap if ≥2 nodes hit but no connecting edge
+   → retrieval_miss otherwise
+2. 0 < overlap < threshold → partial_retrieval
+3. overlap ≥ threshold AND wrong
+   → output_miss if facts don't surface the gold
+   → agent_miss if they do
+
+**Files created.**
+- `engram/diagnostics/overlap.py` (~100 lines)
+- `engram/diagnostics/failures.py` (~270 lines)
+- `engram/diagnostics/coverage.py` (~140 lines)
+- `engram/diagnostics/audit.py` (~80 lines)
+- Rewrote `engram/diagnostics/__init__.py` with correct enum names
+  (the stub had drifted to `prompt_miss / answerer_miss`) and
+  re-exports for all public verbs.
+
+**Tests (33 new; 258 total, was 225 on PR-E).**
+- `tests/test_diagnostics_overlap.py` (8) — key-term extraction,
+  stop-word filtering, casefold, NFKC on empty input, full / partial /
+  zero recall, determinism.
+- `tests/test_diagnostics_coverage.py` (7) — label counts, layer
+  splits (entity vs unlayered), edge counts, ngram_kinds split, totals
+  incl. n_granules, determinism, empty-store zeros.
+- `tests/test_diagnostics_audit.py` (5) — identical match, ingestion
+  field bumps both fingerprints (R4 transitivity), recall-only field
+  leaves ingestion match intact, sorted divergence, (value_a, value_b)
+  preservation.
+- `tests/test_diagnostics_failures.py` (13) — one fixture per enum
+  arm (CORRECT, EXTRACTION_MISS, RETRIEVAL_MISS, PARTIAL_RETRIEVAL,
+  OUTPUT_MISS, AGENT_MISS, GRAPH_GAP), no-store fallback, sort order,
+  configurable threshold, bucket_breakdown aggregation + None-bucket
+  handling, classifier determinism.
+
+**Out of scope (per plan).**
+- PR-G (calibrator) — needs these classifications as its objective
+  function but is its own PR.
+- Commit-over-commit regression report — needs a run-history store.
+- Benchmark CLI integration — per user direction, benchmark plumbing
+  lives in `agent-memory-benchmark` (PR-J).
+
+Test suite: 258 passing (was 225); ruff clean; mypy clean in
+diagnostics scope (0 errors in 4 source + 4 test files). Pre-existing
+56-error baseline on the rest of the repo is unchanged by this PR.
+
+### Current State
+
+- Branch: `feat/pr-f-diagnostics` (open; not yet PR'd against main)
+- `main` at `bcd01c9` — PR-E + mypy cleanup merged
+- Tests: 258 passing, ruff clean, mypy 56 pre-existing errors
+  (0 new in diagnostics scope)
+- Build: `pip install -e .` unchanged
+- `SCHEMA_VERSION = 3`, `memory_version = 0.4.0` (unchanged —
+  diagnostics is read-only; no on-disk format changes).
+
+### What's Next
+
+**Immediate:** open PR-F → main → merge.
+
+The greenfield module triad (ingestion / recall / diagnostics) is now
+complete. Remaining roadmap (documented in the prior session):
+
+- **PR-G** — Per-intent weight calibrator. Uses this PR's
+  `classify_failures` as the objective function over
+  `recall/intents/heldout.json`. Offline tuner; pipeline untouched.
+- **PR-H** — Co-occurrence windowing `(1h, 1d, all-time)`
+  (`derivation_version: 1 → 2`).
+- **PR-I** — ChangeEvent + EpisodicNode emission (manifesto §7 D5/D6).
+  `SCHEMA_VERSION: 3 → 4`.
+- **PR-J** — Benchmark adapter for new engram (lives in
+  `agent-memory-benchmark`, not in this repo — per user direction).
+  Blocks the first real benchmark number.
+
+### Open Questions
+
+- `_has_graph_gap` is a conservative heuristic (≥2 hit nodes +
+  zero edges connecting any pair). It will miss cases where the gap
+  sits between a seed granule and a distant gold node — the actual
+  structural-gap detector would need BFS from the seed. Deferred
+  until we have benchmark cases that show the heuristic misses.
+- The `CORRECT` enum arm is not in the manifesto's R15 list — added
+  here as a neutral bucket so `bucket_breakdown` has complete
+  denominators without a second pass over inputs. If this becomes
+  confusing in consumer code, split into two return types.
+- Key-term extraction is ASCII-only (`[a-zA-Z0-9]+` token regex).
+  Matches the predecessor's kernel. Non-ASCII gold answers
+  (LongMemEval is English; LOCOMO has some Unicode) would silently
+  extract zero terms. If benchmarks surface this, tighten to `\w+`
+  with a Unicode category filter.
+
+### Gotchas
+
+- `FailureInput.bucket` is optional and defaults to `None`;
+  `bucket_breakdown` maps that to the literal string `"(none)"`. If
+  you filter buckets in a report, watch for that key rather than
+  assuming `None`.
+- `classify_failures` returns sorted output by `(question_id, gold)`.
+  If you build a `FailureInput` list from an iterable that's already
+  ordered and your report assumes input-order preservation, wrap
+  inputs with monotonic `question_id`s instead.
+- `fingerprint_audit.diverging_fields` includes non-fingerprint-carrying
+  fields too (if any ever exist). Today the partition covers every
+  field, so the list is a strict subset of fingerprint inputs.
+
+---
+
 ## Session: 2026-04-20 — PR-E (recall implementation)
 
 ### What Was Done

@@ -3,22 +3,64 @@
 **Responsibility.** Given a run's results, classify each failure and surface
 actionable patterns.
 
-**Public verbs.** ``classify_failures``, ``bucket_breakdown``, ``needle_overlap``,
-``extraction_coverage``, ``fingerprint_audit``.
+**Public verbs.** :func:`classify_failures`, :func:`bucket_breakdown`,
+:func:`needle_overlap`, :func:`extraction_coverage`, :func:`fingerprint_audit`.
 
-**Owns.** Failure classification (``R15`` enum:
-``extraction_miss | graph_gap | retrieval_miss | partial_retrieval | prompt_miss | answerer_miss``),
-gold-term overlap, extraction-coverage reports, fingerprint-discipline audits,
+**Owns.** Failure classification (R15 enum:
+``extraction_miss | graph_gap | retrieval_miss | partial_retrieval |
+output_miss | agent_miss``; plus a neutral ``correct`` bucket so
+aggregation keeps complete denominators), gold-term overlap,
+extraction-coverage reports, fingerprint-discipline audits,
 commit-over-commit regression reports.
 
-**Does not touch.** The memory system's runtime path. Read-only. Never writes to
-caches. Never mutates run artifacts.
+**Does not touch.** The memory system's runtime path. Read-only. Never
+writes to caches. Never mutates run artifacts.
 
-**Stability guarantee.** Classifications are versioned. Comparing classifications
-across versions requires a migration note.
+**Stability guarantee.** Classifications are versioned. Comparing
+classifications across versions requires a migration note.
 
-Diagnostics runs first on every failure (``M8``); classification is logged with
-the commit. Layer-decision-tree discipline (``M5``) comes from here: fix the
-deepest broken layer first (``P9``), never patch an upper layer to compensate
-for a lower one.
+Diagnostics runs first on every failure (M8); classification is logged
+with the commit. Layer-decision-tree discipline (M5) comes from here:
+fix the deepest broken layer first (P9), never patch an upper layer to
+compensate for a lower one.
 """
+
+from engram.diagnostics.audit import (
+    FingerprintAuditResult,
+    fingerprint_audit,
+)
+from engram.diagnostics.coverage import (
+    CoverageReport,
+    extraction_coverage,
+)
+from engram.diagnostics.failures import (
+    DEFAULT_PARTIAL_THRESHOLD,
+    BucketReport,
+    FailureCase,
+    FailureInput,
+    FailureKind,
+    bucket_breakdown,
+    classify_failures,
+)
+from engram.diagnostics.overlap import (
+    Overlap,
+    extract_key_terms,
+    needle_overlap,
+)
+
+__all__ = [
+    "DEFAULT_PARTIAL_THRESHOLD",
+    "BucketReport",
+    "CoverageReport",
+    "FailureCase",
+    "FailureInput",
+    "FailureKind",
+    "FingerprintAuditResult",
+    "Overlap",
+    "bucket_breakdown",
+    "classify_failures",
+    "extract_key_terms",
+    "extraction_coverage",
+    "fingerprint_audit",
+    "needle_overlap",
+]
