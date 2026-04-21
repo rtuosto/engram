@@ -10,8 +10,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import pytest
-
 from engram import EngramGraphMemorySystem, Memory, MemorySystem
 from engram.config import MemoryConfig
 from engram.ingestion.pipeline import IngestionPipeline
@@ -124,10 +122,14 @@ def test_save_state_and_load_state_roundtrip(tmp_path: Path) -> None:
     assert state_a.store.num_edges() == state_b.store.num_edges()
 
 
-def test_recall_raises_until_pr_e_ships() -> None:
+def test_recall_on_empty_state_returns_empty_result() -> None:
+    """A freshly-constructed system with no ingests must return an empty
+    :class:`RecallResult` rather than crashing. Benchmark callers rely on
+    this to build cache keys before any ingest has happened."""
     system = _make_system()
-    with pytest.raises(NotImplementedError):
-        asyncio.run(system.recall("any question"))
+    result = asyncio.run(system.recall("any question"))
+    assert result.passages == ()
+    assert result.facts == ()
 
 
 def test_repeat_ingest_creates_new_memory_node() -> None:

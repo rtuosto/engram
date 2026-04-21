@@ -101,43 +101,59 @@ class RetrievedNode:
 class RecallPassage:
     """A ranked snippet of remembered content returned by :meth:`recall`.
 
-    The passage text is a Sentence-level or Turn-level granule. ``score`` is
-    the walk-score from expansion; higher = stronger evidence. ``provenance``
-    points back to the originating ``memory_id`` so the agent can cite /
-    dedupe / follow up.
+    ``text`` is the granule content; ``granularity`` is ``turn`` |
+    ``sentence`` | ``ngram``. ``score`` is the walk-score from expansion.
+    ``node_id`` is the granule's graph node id. ``source_memory_id`` anchors
+    provenance. ``source_memory_index`` is the monotonic ingest order of
+    that Memory. ``supporting_edges`` is a tuple of human-readable strings
+    describing Claims / Preferences this granule asserts (see
+    ``docs/design/recall.md §8``).
     """
 
     text: str
+    granularity: str
     score: float
-    granularity: str  # "turn" | "sentence" | "ngram"
     node_id: str
-    memory_id: str | None = None
+    source_memory_id: str | None = None
+    source_memory_index: int | None = None
     timestamp: str | None = None
+    speaker: str | None = None
+    supporting_edges: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class RecallFact:
-    """A pre-computed fact from the derived indexes.
+    """A pre-computed answer the agent can cite directly.
 
-    Recall consults the derived current-truth / reinforcement indexes for
-    questions the graph can answer exactly (``docs/design/recall.md``).
-    Examples: ``{"alice", "likes", "pizza", confidence=0.92}``.
+    Engram resolves arithmetic, aggregations, and current-truth lookups
+    (``P4``, ``R8``) so the agent never has to compute them.
+
+    ``kind`` is one of ``current_preference`` | ``reinforcement`` |
+    ``change_event`` | ``co_occurrence``. ``value`` is the rendered literal
+    (``"dislikes (as of 2026-03-05; previously liked, 47 reinforcements)"``).
+    ``supporting_memory_ids`` is provenance — the Memories backing the fact.
     """
 
+    kind: str
     subject: str
-    predicate: str
-    object: str
-    confidence: float
+    value: str
+    predicate: str | None = None
+    object: str | None = None
     timestamp: str | None = None
+    supporting_memory_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class RecallResult:
     """Structured output of :meth:`MemorySystem.recall`.
 
-    ``passages`` is the ranked list of retrieved snippets (the main payload
-    the agent reasons over). ``facts`` is pre-computed entries drawn from
-    derived indexes. ``intent`` is the detected query intent (for diagnostics).
+    ``passages`` is the ranked list of retrieved snippets. ``facts`` are
+    pre-computed entries from derived indexes. ``intent`` is the detected
+    query intent; ``intent_confidence`` is the discrimination margin (~0
+    means weakly-classified and the pipeline fell back to ``single_fact``).
+    ``timing_ms`` is a stage-level breakdown (``classify`` / ``seed`` /
+    ``expand`` / ``score`` / ``assemble`` / ``total``).
+    ``recall_fingerprint`` is the audit key the benchmark caches against.
 
     Recall does not produce an answer (``R9``, ``R13``). The agent sees this
     structure and composes the final response.
@@ -146,7 +162,9 @@ class RecallResult:
     passages: tuple[RecallPassage, ...]
     facts: tuple[RecallFact, ...] = ()
     intent: str | None = None
-    retrieval_time_ms: float = 0.0
+    intent_confidence: float = 0.0
+    timing_ms: tuple[tuple[str, float], ...] = ()
+    recall_fingerprint: str | None = None
 
 
 __all__ = [

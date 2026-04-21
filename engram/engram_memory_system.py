@@ -51,6 +51,8 @@ from engram.ingestion.persist import (
 from engram.ingestion.pipeline import IngestionPipeline, InstanceState
 from engram.ingestion.vector_index import VectorIndex
 from engram.models import Memory, RecallResult
+from engram.recall.context import RecallContext
+from engram.recall.pipeline import RecallPipeline
 
 MANIFEST_FILENAME: Final[str] = "manifest.json"
 PRIMARY_FILENAME: Final[str] = "primary.msgpack"
@@ -76,9 +78,11 @@ class EngramGraphMemorySystem:
         config: MemoryConfig | None = None,
         *,
         pipeline: IngestionPipeline | None = None,
+        recall_pipeline: RecallPipeline | None = None,
     ) -> None:
         self._config: MemoryConfig = config or MemoryConfig()
         self._pipeline: IngestionPipeline | None = pipeline
+        self._recall_pipeline: RecallPipeline | None = recall_pipeline
         self._state: InstanceState | None = None
 
     # ------------------------------------------------------------------
@@ -100,10 +104,20 @@ class EngramGraphMemorySystem:
         max_passages: int | None = None,
         intent_hint: str | None = None,
     ) -> RecallResult:
-        raise NotImplementedError(
-            "Recall is landing in PR-E — see docs/design/recall.md. "
-            "This PR ships the protocol surface only."
+        if self._state is None:
+            # No ingests yet — return an empty shell with the recall fingerprint
+            # so the benchmark's cache key remains well-defined.
+            from engram.models import RecallResult as _RR
+
+            return _RR(passages=(), intent=None, intent_confidence=0.0)
+        pipeline = self._get_recall_pipeline()
+        context = RecallContext(
+            now=now,
+            timezone=timezone,
+            max_passages=max_passages,
+            intent_hint=intent_hint,
         )
+        return pipeline.recall(self._state, query, context=context)
 
     async def reset(self) -> None:
         self._state = None
@@ -249,6 +263,13 @@ class EngramGraphMemorySystem:
 
             self._pipeline = build_default_pipeline(self._config)
         return self._pipeline
+
+    def _get_recall_pipeline(self) -> RecallPipeline:
+        if self._recall_pipeline is None:
+            from engram.recall.factory import build_default_recall_pipeline
+
+            self._recall_pipeline = build_default_recall_pipeline(self._config)
+        return self._recall_pipeline
 
     def get_state(self) -> InstanceState | None:
         """Escape hatch for diagnostics / tests — do not use from Recall."""
