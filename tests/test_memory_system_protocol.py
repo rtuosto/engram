@@ -2,9 +2,9 @@
 
 The protocol is the single surface external callers touch — the
 ``agent-memory-benchmark`` repo and this repo's :mod:`engram.diagnostics`
-(``docs/DESIGN-MANIFESTO.md §R1``, ``§6``). This test pins the shape so that
-adding or removing a public verb is an intentional, reviewable change — not a
-silent refactor that breaks the measurement instrument.
+(``docs/DESIGN-MANIFESTO.md §R1``, ``§6``). This test pins the shape so
+that adding or removing a public verb is an intentional, reviewable change
+— not a silent refactor that breaks the measurement instrument.
 
 A minimal ``FakeMemory`` implementation is included both as a runtime-check
 witness (``isinstance(fake, MemorySystem)``) and as executable documentation
@@ -18,12 +18,11 @@ from pathlib import Path
 
 import pytest
 
-from engram import AnswerResult, MemorySystem, RetrievedNode, Session, Turn
+from engram import Memory, MemorySystem, RecallResult
 
 _EXPECTED_VERBS = frozenset({
-    "ingest_session",
-    "finalize_conversation",
-    "answer_question",
+    "ingest",
+    "recall",
     "reset",
     "save_state",
     "load_state",
@@ -39,23 +38,19 @@ class _FakeMemory:
     memory_system_id: str = "fake"
     memory_version: str = "0.0.1-test"
 
-    async def ingest_session(self, session: Session, conversation_id: str) -> None:
+    async def ingest(self, memory: Memory) -> None:
         return None
 
-    async def finalize_conversation(self, conversation_id: str) -> None:
-        return None
-
-    async def answer_question(
-        self, question: str, conversation_id: str
-    ) -> AnswerResult:
-        return AnswerResult(
-            answer="",
-            context="",
-            retrieved_nodes=(),
-            retrieval_time_ms=0.0,
-            answer_time_ms=0.0,
-            total_time_ms=0.0,
-        )
+    async def recall(
+        self,
+        query: str,
+        *,
+        now: str | None = None,
+        timezone: str | None = None,
+        max_passages: int | None = None,
+        intent_hint: str | None = None,
+    ) -> RecallResult:
+        return RecallResult(passages=())
 
     async def reset(self) -> None:
         return None
@@ -71,6 +66,15 @@ def test_protocol_exposes_expected_verbs() -> None:
     """All R1 public verbs must exist on the Protocol as callables."""
     for verb in _EXPECTED_VERBS:
         assert hasattr(MemorySystem, verb), f"MemorySystem missing public verb: {verb}"
+
+
+def test_protocol_has_no_deprecated_verbs() -> None:
+    """Pre-pivot verbs must be gone — the protocol no longer carries them."""
+    for removed in ("ingest_session", "finalize_conversation", "answer_question"):
+        assert not hasattr(MemorySystem, removed), (
+            f"deprecated verb {removed} still on MemorySystem — "
+            f"post-pivot surface is ingest/recall/reset/save_state/load_state"
+        )
 
 
 def test_protocol_exposes_identity_attributes() -> None:
@@ -106,40 +110,48 @@ def test_public_verbs_have_docstrings(verb: str) -> None:
     assert doc.strip(), f"{verb} missing docstring"
     has_rule_citation = any(
         marker in doc
-        for marker in ("R1", "R2", "R4", "R5", "R12", "P8", "K5", "M5", "docs/DESIGN-MANIFESTO")
+        for marker in (
+            "R1",
+            "R2",
+            "R4",
+            "R5",
+            "R8",
+            "R9",
+            "R12",
+            "R13",
+            "R16",
+            "P8",
+            "K5",
+            "M5",
+            "docs/design",
+            "docs/DESIGN-MANIFESTO",
+        )
     )
     assert has_rule_citation, (
         f"{verb} docstring must cite at least one manifesto rule/principle — "
-        f"got: {doc[:100]!r}"
+        f"got: {doc[:120]!r}"
     )
 
 
 async def test_fake_memory_roundtrip() -> None:
-    """End-to-end smoke: instantiate → ingest → finalize → answer → reset."""
+    """End-to-end smoke: instantiate → ingest → recall → reset."""
     fake = _FakeMemory()
-    session = Session(
-        session_index=1,
-        timestamp="2026-04-20T10:00:00",
-        turns=(
-            Turn(speaker="user", text="hello", session_index=1, turn_index=1),
-            Turn(speaker="assistant", text="hi", session_index=1, turn_index=2),
-        ),
+    memory = Memory(
+        content="hello world",
+        timestamp="2026-04-20T10:00:00Z",
+        speaker="user",
     )
-    await fake.ingest_session(session, "conv-1")
-    await fake.finalize_conversation("conv-1")
-    result = await fake.answer_question("what did I say?", "conv-1")
-    assert isinstance(result, AnswerResult)
-    assert result.answer == ""
-    assert isinstance(result.retrieved_nodes, tuple)
+    await fake.ingest(memory)
+    result = await fake.recall("what did I say?")
+    assert isinstance(result, RecallResult)
+    assert result.passages == ()
     await fake.reset()
 
 
-def test_retrieved_node_is_frozen() -> None:
-    node = RetrievedNode(
-        node_id="n1",
-        node_type="turn",
-        text="hello",
-        conversation_id="c1",
+def test_recall_kwargs_shape() -> None:
+    """``recall`` signature must accept the context kwargs (now, timezone, max_passages, intent_hint)."""
+    sig = inspect.signature(MemorySystem.recall)
+    expected_params = {"self", "query", "now", "timezone", "max_passages", "intent_hint"}
+    assert set(sig.parameters) == expected_params, (
+        f"recall signature mismatch: {sorted(sig.parameters)} vs {sorted(expected_params)}"
     )
-    with pytest.raises(AttributeError):
-        node.node_id = "n2"  # type: ignore[misc]

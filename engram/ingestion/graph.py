@@ -9,8 +9,9 @@ results in a deterministic order (sorted by node_id, then edge type). The
 underlying ``MultiDiGraph``'s natural iteration order is hash-seed-dependent;
 this wrapper sorts on the way out.
 
-**Freeze semantics.** ``finalize_conversation`` calls :meth:`freeze`. After
-that, writes raise :class:`GraphFrozenError`. Reads remain open.
+**Freeze semantics.** Callers may call :meth:`freeze` after ingestion
+completes (e.g., before a derived-rebuild pass in PR-D). After freeze,
+writes raise :class:`GraphFrozenError`. Reads remain open.
 
 **Multi-labeling.** A node carries ``labels: frozenset[str]`` plus one payload
 attribute per label (key = label name). Adding a second label merges; payloads
@@ -40,11 +41,13 @@ class NodeNotFoundError(KeyError):
 
 @dataclass
 class GraphStore:
-    """One conversation's graph.
+    """One engram instance's graph.
 
-    Instantiated per ``conversation_id``; owned by the ingestion pipeline.
-    Exposed to Recall read-only (callers should not mutate after
-    :meth:`freeze`).
+    ``conversation_id`` is retained as an opaque tag (default
+    ``"__instance__"``) — it has no semantic meaning in the
+    post-pivot architecture (``R1``: one instance = one memory, no
+    conversation partitioning). Exposed to Recall read-only (callers
+    should not mutate after :meth:`freeze`).
     """
 
     conversation_id: str

@@ -1,19 +1,25 @@
-"""Stage [5] — Preference detection.
+"""Stage [7] — Preference detection.
 
-Prototype-centroid classification per ``docs/design/ingestion.md §5``.
+Prototype-centroid classification per ``docs/design/ingestion.md §9``.
 Model-free at the caller-visible surface: the detector takes precomputed
 centroids and a text-embedding callable; production wires the real encoder,
 tests can pass a mock.
 
-**Fails closed.** A Claim whose top-polarity margin is below
-``MemoryConfig.preference_discrimination_margin`` remains a pure Claim — no
-Preference overlay, no ``holds_preference`` edge. R6-compliant: low-confidence
-structure would taint multi-session aggregation.
+**Fails closed.** A Sentence whose top-polarity margin is below
+``MemoryConfig.preference_discrimination_margin`` emits no Preference node
+and no ``holds_preference`` edge. R6-compliant: low-confidence structure
+would taint multi-Memory aggregation.
 
-**Per-polarity fails closed (held-out gate).** A polarity whose median margin
-on the disjoint held-out set sits below the runtime margin threshold is
-*blanket-disabled* for the whole corpus; no Preferences of that polarity are
-ever emitted. Computed by callers via
+**R16.** Preference is its own content-addressed node (not a Claim
+overlay). Identity: ``(holder_id, polarity, target_id_or_literal)``. Two
+sentences expressing the same preference converge to one Preference node;
+each expression is a separate ``holds_preference`` edge from the speaker
+Entity (evidence strength on the edge weight). Reinforcement is derived.
+
+**Per-polarity fails closed (held-out gate).** A polarity whose median
+margin on the disjoint held-out set sits below the runtime margin threshold
+is *blanket-disabled* for the whole corpus; no Preferences of that polarity
+are ever emitted. Computed by callers via
 :func:`engram.ingestion.preferences.median_discrimination_margin`.
 """
 
@@ -28,6 +34,8 @@ from engram.ingestion.schema import (
     PREFERENCE_POLARITIES,
     ClaimPayload,
     PreferencePayload,
+    node_id,
+    preference_identity,
 )
 
 
@@ -82,23 +90,32 @@ def classify(
 
 def build_preference_payload(
     verdict: PreferenceVerdict,
-    claim_id: str,
     claim_payload: ClaimPayload,
     speaker_entity_id: str,
-) -> PreferencePayload:
-    """Materialize a :class:`PreferencePayload` co-located on ``claim_id``.
+) -> tuple[str, PreferencePayload]:
+    """Materialize a content-addressed Preference node (R16).
 
-    The holder is the speaker. Target comes from the Claim's object slot —
-    entity-resolved target preferred; falls back to literal.
+    Returns ``(preference_node_id, payload)``. The holder is the speaker.
+    Target comes from the Claim's object slot — entity-resolved target
+    preferred; falls back to literal. ``verdict.confidence`` is not on the
+    payload — it belongs on the ``holds_preference`` edge weight
+    (per-observation evidence strength).
     """
-    return PreferencePayload(
+    payload = PreferencePayload(
         holder_id=speaker_entity_id,
         polarity=verdict.polarity,
         target_id=claim_payload.object_id,
         target_literal=claim_payload.object_literal,
-        source_claim_id=claim_id,
-        confidence=verdict.confidence,
     )
+    pid = node_id(
+        preference_identity(
+            holder_id=payload.holder_id,
+            polarity=payload.polarity,
+            target_id=payload.target_id,
+            target_literal=payload.target_literal,
+        )
+    )
+    return pid, payload
 
 
 __all__ = [

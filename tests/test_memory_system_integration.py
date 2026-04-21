@@ -1,7 +1,8 @@
 """End-to-end test of :class:`EngramGraphMemorySystem` with mocked models.
 
-Exercises the full verb surface: ingest → finalize → save → load → inspect.
-Uses fakes from :mod:`tests._fake_nlp` so the test is fast and hermetic.
+Exercises the post-pivot verb surface: ingest(Memory) → save → load →
+inspect. Uses fakes from :mod:`tests._fake_nlp` so the test is fast and
+hermetic.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from engram import EngramGraphMemorySystem, MemorySystem
+from engram import EngramGraphMemorySystem, Memory, MemorySystem
 from engram.config import MemoryConfig
 from engram.ingestion.pipeline import IngestionPipeline
 from engram.ingestion.preferences import compute_centroids
@@ -21,12 +22,11 @@ from engram.ingestion.schema import (
     EDGE_PART_OF,
     LABEL_CLAIM,
     LABEL_ENTITY,
-    LABEL_SESSION,
+    LABEL_MEMORY,
     LABEL_TURN,
     LABEL_UTTERANCE_SEGMENT,
     PREFERENCE_POLARITIES,
 )
-from engram.models import Session, Turn
 from tests._fake_nlp import (
     FakeEnt,
     FakeSent,
@@ -38,7 +38,7 @@ from tests._fake_nlp import (
 )
 
 
-def _build_session() -> tuple[Session, dict]:
+def _build_memory() -> tuple[Memory, dict]:
     text = "Alice loves hiking."
     root = make_token("loves", idx=6, pos="VERB", dep="ROOT", lemma="love", tense=("Pres",))
     nsubj = make_token("Alice", idx=0, pos="PROPN", dep="nsubj")
@@ -53,25 +53,18 @@ def _build_session() -> tuple[Session, dict]:
         sents=[sent],
         ents=[FakeEnt(text="Alice", label_="PERSON", start_char=0, end_char=5)],
     )
-    session = Session(
-        session_index=1,
-        turns=(
-            Turn(
-                speaker="user",
-                text=text,
-                session_index=1,
-                turn_index=1,
-                timestamp="2026-01-01T00:00:00Z",
-            ),
-        ),
+    memory = Memory(
+        content=text,
         timestamp="2026-01-01T00:00:00Z",
+        speaker="user",
+        source="conversation_turn",
     )
-    return session, {text: doc}
+    return memory, {text: doc}
 
 
 def _make_system(config: MemoryConfig | None = None) -> EngramGraphMemorySystem:
     config = config or MemoryConfig()
-    _session, docs = _build_session()
+    _memory, docs = _build_memory()
     embed = deterministic_embed(dim=16)
     centroids = compute_centroids(embed)
     pipeline = IngestionPipeline(
@@ -89,20 +82,18 @@ def test_implements_memory_system_protocol() -> None:
     assert isinstance(system, MemorySystem)
 
 
-def test_ingest_and_finalize_populates_expected_labels() -> None:
+def test_ingest_populates_expected_labels() -> None:
     system = _make_system()
-    session, _ = _build_session()
+    memory, _ = _build_memory()
 
     async def run() -> None:
-        await system.ingest_session(session, "c1")
-        await system.finalize_conversation("c1")
+        await system.ingest(memory)
 
     asyncio.run(run())
-    state = system.get_state("c1")
+    state = system.get_state()
     assert state is not None
     store = state.store
-    assert store.frozen is True
-    assert len(store.nodes_by_label(LABEL_SESSION)) == 1
+    assert len(store.nodes_by_label(LABEL_MEMORY)) == 1
     assert len(store.nodes_by_label(LABEL_TURN)) == 1
     assert len(store.nodes_by_label(LABEL_UTTERANCE_SEGMENT)) == 1
     assert len(store.nodes_by_label(LABEL_ENTITY)) >= 1
@@ -111,72 +102,75 @@ def test_ingest_and_finalize_populates_expected_labels() -> None:
 
 def test_save_state_and_load_state_roundtrip(tmp_path: Path) -> None:
     system = _make_system()
-    session, _ = _build_session()
+    memory, _ = _build_memory()
 
     async def ingest() -> None:
-        await system.ingest_session(session, "c1")
-        await system.finalize_conversation("c1")
+        await system.ingest(memory)
         await system.save_state(tmp_path)
 
     asyncio.run(ingest())
 
     manifest = tmp_path / "manifest.json"
     assert manifest.exists()
-    assert (tmp_path / "c1.msgpack").exists()
+    assert (tmp_path / "primary.msgpack").exists()
 
     restored = _make_system()
     asyncio.run(restored.load_state(tmp_path))
-    state_a = system.get_state("c1")
-    state_b = restored.get_state("c1")
+    state_a = system.get_state()
+    state_b = restored.get_state()
     assert state_a is not None and state_b is not None
     assert state_a.store.num_nodes() == state_b.store.num_nodes()
     assert state_a.store.num_edges() == state_b.store.num_edges()
 
 
-def test_answer_question_raises_until_recall_ships() -> None:
+def test_recall_raises_until_pr_e_ships() -> None:
     system = _make_system()
     with pytest.raises(NotImplementedError):
-        asyncio.run(system.answer_question("any question", "c1"))
+        asyncio.run(system.recall("any question"))
 
 
-def test_ingest_rejects_frozen_conversation() -> None:
+def test_repeat_ingest_creates_new_memory_node() -> None:
+    """R16: each ingest is an observation event — no dedup, even on identical content."""
     system = _make_system()
-    session, _ = _build_session()
+    memory, _ = _build_memory()
 
     async def run() -> None:
-        await system.ingest_session(session, "c1")
-        await system.finalize_conversation("c1")
-        # Second ingest on frozen conversation must fail.
-        await system.ingest_session(session, "c1")
+        await system.ingest(memory)
+        await system.ingest(memory)
 
-    from engram.ingestion.graph import GraphFrozenError
+    asyncio.run(run())
+    state = system.get_state()
+    assert state is not None
+    # Two ingest calls → two Memory nodes even with identical content.
+    assert len(state.store.nodes_by_label(LABEL_MEMORY)) == 2
+    # Turn granule is Memory-scoped (identity = memory_id), so two too.
+    assert len(state.store.nodes_by_label(LABEL_TURN)) == 2
+    # But the Entity ("Alice") is content-addressed — one node, two inbound edges.
+    alice_ids = state.store.nodes_by_label(LABEL_ENTITY)
+    assert len(alice_ids) >= 1
 
-    with pytest.raises(GraphFrozenError):
-        asyncio.run(run())
 
-
-def test_reset_clears_conversations() -> None:
+def test_reset_clears_state() -> None:
     system = _make_system()
-    session, _ = _build_session()
+    memory, _ = _build_memory()
 
     async def run() -> None:
-        await system.ingest_session(session, "c1")
+        await system.ingest(memory)
         await system.reset()
 
     asyncio.run(run())
-    assert system.get_state("c1") is None
+    assert system.get_state() is None
 
 
 def test_basic_edge_types_present() -> None:
     system = _make_system()
-    session, _ = _build_session()
+    memory, _ = _build_memory()
 
     async def run() -> None:
-        await system.ingest_session(session, "c1")
-        await system.finalize_conversation("c1")
+        await system.ingest(memory)
 
     asyncio.run(run())
-    state = system.get_state("c1")
+    state = system.get_state()
     assert state is not None
     edges_by_type: dict[str, int] = {}
     for _src, _dst, edge_type, _attrs in state.store.iter_edges():
