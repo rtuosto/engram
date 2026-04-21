@@ -1,613 +1,586 @@
 # Ingestion — Design
 
-> **Scope.** The complete ingestion design for the first implementation PR (Tier-1 edges per §2). Graph storage (§1), node/edge schema (§2), extraction pipeline (§3), model choices (§4), preference-detection validation (§5), entity canonicalization (§6), operational policy (§7), dependencies and tests (§8).
-> **Deferred to later design-doc iterations.** Event / Episode node extraction (Tier 2), coreference-augmented canonicalization, Tier 3 edges (`supports` / `contradicts` / `refers_back_to`). Each a separate design-doc iteration with its own M1 hypothesis before implementation.
-> **Status.** Draft for review. The binding rules are in [`../DESIGN-MANIFESTO.md`](../DESIGN-MANIFESTO.md); this doc is implementation-level and evolves as the module is built.
+> **Scope.** The ingestion side of engram under the post-pivot architecture. Engram is a memory tool for an outside agent; `ingest(memory)` is one of the two core verbs. This doc covers: the `Memory` shape, graph storage, the 5-layer × 4-granularity model, append-only primary data, derived-index rebuilds, the deterministic extraction pipeline, model choices, validation protocols, dependencies, tests, and the patch path from the existing Tier-1 implementation.
+> **Status.** Draft for review; revises the prior version of this doc that predated the engram-as-tool pivot. The binding rules are in [`../DESIGN-MANIFESTO.md`](../DESIGN-MANIFESTO.md); this doc is implementation-level and evolves as the module is built.
 
 ---
 
-## 1. Graph Storage
+## 1. The `Memory` shape
+
+`ingest` accepts a single `Memory` per call. Each call is a permanent observation event — never deduplicated.
+
+```python
+@dataclass(frozen=True, slots=True)
+class Memory:
+    content: str                             # the text payload (required)
+    timestamp: str | None = None             # ISO-8601, agent-supplied
+    speaker: str | None = None               # "user", "assistant", or any freeform label
+    source: str | None = None                # where this came from: "conversation_turn", "file:notes.md", ...
+    metadata: dict[str, str] = field(default_factory=dict)  # freeform agent hints
+    # (later: attachments / multimodal fields when needed)
+```
+
+Engram is agnostic to what the agent decides constitutes a memory. The benchmark may ingest one Memory per conversation turn; a real-world deployment may ingest a long document as a single Memory and let segmentation handle it. Multi-modal fields are deferred — text-only ingest in the first cut.
+
+The tool-call schema engram exposes to the agent mirrors this dataclass's fields.
+
+---
+
+## 2. Graph storage
 
 ### Constraints
 
-- **R2 — Determinism.** Same `(config, corpus)` → byte-identical serialized state. No wall-clock values, no PID-seeded randomness, no unsorted set iteration in output. This is the dominant constraint.
-- **R12 — Versioned persistence.** Every on-disk artifact carries an explicit schema version; load paths handle missing / old / future versions with a clear error, not a silent crash.
-- **P10 — Graph encodes knowledge; embeddings rank candidates.** The graph is a data structure we traverse; it is *not* a query engine whose optimizer we trust. Recall-side traversals are typed-edge BFS with small fan-out — we write them by hand against a simple API.
-- **Scale.** LongMemEval-s: 100 conversations, up to ~50 sessions each, on the order of tens of thousands of nodes per conversation at the finest granularity. LOCOMO is comparable. We are not RAM-bound. Anything that scales beyond this is premature.
-- **Iteration speed.** The node/edge schema will change many times during the design phase. The cost of re-serializing a corpus after a schema bump must be seconds, not hours.
-
-### Options considered
-
-| Option | R2 story | R12 story | Schema iteration | Footprint | Notes |
-|---|---|---|---|---|---|
-| `networkx` in-memory + custom serializer | Easy — `sorted(G.nodes(data=True))` everywhere | We own it — explicit version marker, small audit surface | Pure-Python dataclasses, rename-at-will | Zero external infra | Introspectable; no query language (we write traversals ourselves — fine per P10) |
-| `kuzu` embedded graph DB | Query plans may reorder; need to sort results everywhere | Format versioning is upstream's; drift on upgrades is a risk | Cypher-schema migrations needed on every bump | External native lib | Cypher is nice but we don't need it for typed-edge BFS |
-| DuckDB + SQL/PGQ | Attainable with `ORDER BY` everywhere; PGQ planner is young | DuckDB has a versioned on-disk format | SQL migrations | Mature, columnar | PGQ still evolving in DuckDB; overkill for tens of thousands of nodes |
-| Custom numpy-adjacency | Excellent — fixed types, sorted buckets, reproducible floats | We own it | Largest — every schema change touches array layouts | Minimal at runtime | High implementation burden for a problem that is not yet performance-bound |
+- **R2 — Determinism.** Same `(config, ingested log)` → byte-identical serialized state. No wall-clock values, no PID-seeded randomness, no unsorted set iteration in output.
+- **R12 — Versioned persistence.** Every on-disk artifact carries an explicit schema version; load paths handle missing / old / future versions with a clear error.
+- **R16 — Memories append-only; primitives content-addressed.** Memory nodes are timestamped events, never deduplicated. Entity / N-gram / Claim / Preference content is content-addressed (same content → same node ID); observations are edges.
+- **R17 — Derived indexes are rebuildable.** Co-occurrence counts, alias sets, current-truth indexes, episodic clusters live in a derived layer that is recomputed from primary, not mutated in place.
+- **P10 — Graph encodes knowledge; embeddings rank candidates.** The graph is a data structure we traverse; vector search runs over a parallel index.
+- **Scale.** LongMemEval-s: hundreds of conversations, tens of thousands of granule nodes per conversation. LOCOMO comparable. Not RAM-bound at this scale.
 
 ### Decision
 
-**In-memory `networkx.MultiDiGraph` per conversation, persisted through an explicit `engram.ingestion.persist` module that writes schema-versioned msgpack.**
+**One in-memory `networkx.MultiDiGraph` per engram instance, plus a parallel embedding vector index, persisted through schema-versioned msgpack.**
 
-- **Per-conversation graph, not a single global graph.** `MemorySystem.ingest_session(session, conversation_id)` and `answer_question(question, conversation_id)` are conversation-scoped. Keeping one `MultiDiGraph` per `conversation_id` makes the R2 story trivial (no cross-conversation ordering to worry about) and matches how the benchmark iterates.
-- **`MultiDiGraph` (not `DiGraph`)** — parallel edges of different types between the same pair of nodes are load-bearing. A Turn can both `mentions` an Entity and `about` it via a different edge path.
-- **Custom serializer, not `pickle` / `nx.node_link_data` / `nx.gml`.** Pickle is R12-hostile (version-brittle, opaque). `node_link_data` loses type information. We write a small module that emits `{"schema_version": N, "memory_system_id": ..., "conversations": {...}}` and refuses to load foreign versions.
-- **msgpack over JSON.** Both are deterministic with sorted keys. msgpack is smaller and preserves binary embedding vectors without base64. We keep a `--format=json` debug mode for human inspection; the canonical format is msgpack.
+- One engram instance holds one memory. No conversation-id partitioning at the storage layer.
+- `MultiDiGraph` (not `DiGraph`) — parallel edges of different types between the same pair of nodes are load-bearing. A Sentence both `mentions` an Entity and `asserts` a Claim about it via different edges.
+- Embeddings live as a parallel `numpy` matrix keyed by node ID (granule-only — Session, Turn, Sentence, N-gram). Nearest-neighbor search is a brute-force cosine-sim pass at this scale; swap to `faiss` if the scale triggers below fire.
+- Custom serializer (msgpack with a `schema_version` envelope, never `pickle` — version-brittle, opaque). msgpack preserves binary embedding bytes without base64.
 
-### Consequences
+### Scaling triggers (when we revisit storage)
 
-- **Pros.**
-  - Schema iteration is dataclass refactors — minutes, not hours.
-  - R2 is shallow work: one sorted-iteration helper and one canonical serializer.
-  - R12 audit surface is small — one module, one schema version enum.
-  - No external infra; tests are pure Python.
-  - Transparent: every decision is a Python attribute we can print.
-- **Cons (with explicit mitigations, not hand-waves).**
-  - *Traversals are hand-written code.* Mitigated by writing **one** generic typed-edge BFS parameterized by `(edge_type_weights: dict[str, float], max_depth: int, max_frontier: int)`. Adding an edge type to the manifesto is a dict entry, not a new function. Code size stays constant as the edge taxonomy grows.
-  - *In-memory only; Python object overhead dominates at scale.* Not a current bottleneck; current scale (LME-s, LOCOMO) sits well under the thresholds below. Mitigated by a `GraphStore` interface with explicit swap triggers (see "Scaling triggers" below) so the call is made against data, not vibes.
-  - *Weight semantics could diverge across edge types* (count-based `co_occurs_with` vs. evidence-strength `supports` vs. similarity-based `refers_back_to`). Mitigated by: **every edge-type weight normalized to `[0, 1]`** with its meaning documented in the edge-type table, and **intent-specific weight profiles live at the recall-planning layer**, not baked into the graph. The graph stores normalized evidence; recall composes it.
-  - *Serialization throughput is Python-bound.* Mitigated by per-conversation files and batch-friendly msgpack.
-- **What this forecloses.**
-  - Cypher / PGQ query ergonomics. If Recall ever grows a query language, we swap storage — the `MemorySystem` protocol hides this. Not expected for 1.0.
-- **Escape hatch.** The ingestion module exposes a narrow `GraphStore` interface around the `MultiDiGraph`: add-node, add-edge, neighbors-by-edge-type (returns sorted neighbors for R2), snapshot-for-persist, restore-from-persist, and the generic typed-edge traversal above. Swapping the backing store later is a localized change — nothing above this interface sees networkx.
+We swap the backing store with data, a benchmark, and a new design-doc section if any of:
 
-### Scaling triggers (when we revisit the storage decision)
-
-The decision is networkx-now-with-a-swap-path, not networkx-forever. We revisit — with data, a benchmark, and a new design-doc section — if *any* of the following holds on a representative corpus:
-
-| Signal | Threshold | Why it matters |
+| Signal | Threshold | Why |
 |---|---|---|
-| Working-set memory per conversation | > 500 MB | Python object overhead starts hurting at ~1M nodes; beyond 500 MB we're paging |
-| Peak corpus RAM (all conversations in parallel eval) | > 16 GB | Above comfortable laptop / dev box headroom |
-| `ingest_session` p50 | > 2 s | Iteration speed dies if a 50-session corpus takes over a minute to load |
-| `answer_question` p50 traversal time (in-graph only, excl. LLM) | > 100 ms | Recall budget is eaten by storage, not by embedding or reranking |
-| Single conversation `co_occurs_with` edge count | > 500k | Signals a combinatorial explosion we should probably cap at ingest, not store |
-| Single-conversation msgpack size | > 200 MB | Load/save becomes a noticeable fraction of a run |
+| Working-set memory per instance | > 2 GB | Python object overhead becomes painful |
+| Granule count in one instance | > 5 M | Brute-force vector search starts dominating recall latency |
+| `ingest` p50 (per Memory) | > 200 ms | Tool latency hurts agent throughput |
+| `recall` p50 (excl. agent's LLM) | > 100 ms | Recall budget eaten by storage, not by traversal |
+| msgpack snapshot size | > 1 GB | Save/load becomes a noticeable run share |
 
-None of these are current concerns on LME-s or LOCOMO. They exist so that the swap is triggered by measured pain, not by speculation, and so that no one reopens the debate in a one-off PR without data.
+### R2 serialization discipline (non-negotiable)
 
-### R2 Serialization Discipline (non-negotiable)
+1. **Sort before iterate.** Any iteration whose output order is observable walks `sorted(items, key=str)`.
+2. **No `datetime.now()`.** Timestamps in the graph come from the ingested Memory.
+3. **No PID-seeded randomness.** All RNGs explicitly seeded from config (R14).
+4. **Floats: stable reduction order.** Aggregations sort contributors by ID before summing.
+5. **Set → `frozenset`, sorted tuple on serialize.** Python set iteration is hash-seed-dependent.
 
-Every function that emits a byte string does so under these rules:
-
-1. **Sort before iterate.** Any iteration whose output order is observable (persistence, fingerprint, log) walks `sorted(items, key=str)`.
-2. **No `datetime.now()`.** Timestamps in the graph are copied from inputs. Wall-clock values never appear in persisted state.
-3. **No PID-seeded randomness.** All RNGs are explicitly seeded from config. See R14.
-4. **Floats: stable reduction order.** When we aggregate (e.g. `co_occurs_with` weights), we sort contributors by ID before summing. Budgeted non-determinism is declared in config, not assumed.
-5. **Set → `frozenset`, converted to sorted tuple on serialize.** Python's `set` iteration order is hash-seed-dependent; sorted tuples are not.
-
-A CI test (future: `tests/test_ingest_determinism.py`) ingests the same synthetic corpus twice in one process and asserts byte-equality on the serialized output. This is an R2 audit, not a nice-to-have.
+A CI test (`tests/test_ingest_determinism.py`) ingests the same synthetic log twice in one process and asserts byte-equality. This is an R2 audit, not a nice-to-have.
 
 ---
 
-## 2. Node and Edge Schema
+## 3. Layers and granularities
 
-### Node identity
+### Five layers
 
-Every node has a content-addressed ID:
+Layers are content-classification labels. A node may carry multiple layer labels (a Claim is both `relationship` and, when time-anchored, indirectly `temporal` via `temporal_at`).
 
-```
-node_id = sha256(canonical_form).hexdigest()[:16]
-```
+- **Episodic** — clustered memories about an entity + topic over a time span. Lives in the derived layer (computed from primary observations grouped by entity + topic + time-window). Example: an EpisodicNode "Alice + project + 2026-03" linking the granules where Alice and the project were discussed in March.
+- **Entity** — canonicalized nouns. One Entity node per (canonical_form, entity_type), shared across all Memories that reference them.
+- **Relationship** — typed connections: preferences (likes/dislikes/wants/avoids/commits_to/rejects), assertions (Claims), co-occurrence. Relationships carry `asserted_at` attributes and outbound `temporal_at` edges to TimeAnchors.
+- **Temporal** — TimeAnchor nodes (one per distinct timestamp ingested) plus `temporal_at` / `temporal_before` / `temporal_after` edges. Lets us group "everything observed in March 2026" or "all relationships established before this Memory."
+- **Semantic** — the embedding vector attached to each granule node, indexed in a parallel vector store. Nearest-neighbor search is the recall-side entry point for "find granules with similar meaning to this query."
 
-`canonical_form` is a stable, sorted-key JSON string built from the node's *identity fields* (below). IDs are:
+### Four granularities
 
-- **Deterministic under R2** — same identity fields → same ID.
-- **Insertion-order-invariant** — a Turn's ID is the same whether it arrives first or last.
-- **Collision-safe at our scale** — 64-bit truncation gives 2⁶⁴ space for ≪10⁶ nodes per corpus.
-- **Globally unique across conversations where appropriate** — a canonicalized Entity "Alice" shared across two conversations has the same ID, enabling (future) cross-conversation aggregation. A Turn is conversation-scoped and includes `conversation_id` in its identity fields.
+Granularity is a label on each granule node. Granules carry semantic embeddings.
 
-Identity fields per node type:
+- **Session** — a derived grouping of related Memories from the same source within a time window. Not an input; computed during derived rebuild.
+- **Turn** — one ingested Memory's primary content. Memory boundary IS Turn boundary.
+- **Sentence** — a single sentence inside a Turn, segmented via spaCy.
+- **N-gram** — a key phrase inside a Sentence. spaCy noun chunks (`doc.noun_chunks`) and dependency subtrees (subject + verb + object) — both are NLP-fast and parseable, no LLM.
 
-| Node type | Identity fields |
-|---|---|
-| Turn | `(conversation_id, session_index, turn_index)` |
-| Utterance Segment | `(turn_id, segment_index)` |
-| Entity | `(canonical_form, entity_type)` — shared across conversations after canonicalization |
-| Claim | `(subject_id, predicate, object_id, asserted_by_turn_id)` — a claim is a *speaker's assertion at a point in time*, not a world truth |
-| Preference | same as Claim (a Preference is a Claim subtype) |
-| Event | `(canonical_description_hash, interval_start, interval_end)` — see §2.timestamps |
-| Episode | `(conversation_id, episode_cluster_id)` where cluster ID is deterministic from its member Turn IDs |
-| Session | `(conversation_id, session_index)` |
+### Layers as labels, semantic as parallel index
 
-### Multi-labeling
+Each node carries:
+- `granularity: str` (one of `session | turn | sentence | ngram`) for granule nodes; absent for non-granules (Entity, Claim, Preference, EpisodicNode, TimeAnchor).
+- `layers: frozenset[str]` covering `episodic | entity | relationship | temporal | semantic`.
 
-A Claim that is also a Preference is **one node**, not two. Multi-labeling is expressed via the `labels` attribute:
+The semantic layer is implemented as a parallel `numpy.ndarray` of shape `(num_granules, embedding_dim)` plus a `node_ids: list[str]` array. Adding a granule appends a row; rebuilding doesn't move existing rows (R2).
+
+---
+
+## 4. Append-only primary, rebuildable derived
+
+### Primary data — created on `ingest`, never mutated
+
+**Memory nodes** — one per ingest call; carry `content`, `timestamp`, `speaker`, `source`, `metadata`, and a `memory_index` (monotonic per-instance). Never deduplicated.
+
+**Granule nodes** — Turn (one per Memory), Sentence (per spaCy `Doc.sents`), N-gram (per noun chunk + dep subtree). Each granule has its own content + char span + parent reference + embedding.
+
+**Entity nodes** — content-addressed by `(canonical_form, entity_type)`. Created the first time the canonical form is seen; never updated thereafter. Aliases / observation counts live in derived indexes.
+
+**Claim nodes** — content-addressed by `(subject_id, predicate, object_id_or_literal)`. Created the first time this assertion appears; never updated. Each observation is an `asserts` edge from the source granule.
+
+**Preference nodes** — content-addressed by `(holder_id, polarity, target_id_or_literal)`. Same lifecycle as Claims. Each observation is a `holds_preference` edge from the speaker entity (with the source granule referenced via the edge attrs).
+
+**TimeAnchor nodes** — content-addressed by the ISO-8601 timestamp (rounded to a configurable resolution, default 1 second). One per distinct ingested timestamp.
+
+**Primary edges** (set on `ingest`, never mutated):
+- `part_of` — Sentence → Turn, N-gram → Sentence, Turn → Memory.
+- `mentions` — Granule → Entity. Multiple Granules may mention the same Entity.
+- `asserts` — Granule → Claim. Multiple Granules may assert the same Claim (reinforcement).
+- `holds_preference` — Entity[holder] → Preference. Multiple observations of the same Preference are multiple edges (reinforcement).
+- `about` — Claim → Entity, Preference → Entity.
+- `temporal_at` — Granule → TimeAnchor, Relationship → TimeAnchor.
+
+### Derived indexes — rebuilt from primary, never mutated in place
+
+Triggered lazily before recall (or explicitly via an internal `rebuild_derived()` pass).
+
+- **Alias sets per Entity.** For each Entity node, the sorted tuple of distinct surface forms observed across all its `mentions` edges. Stored as a sidecar dict, not on the Entity node payload.
+- **Co-occurrence edges** — `co_occurs_with` between Entity pairs, weighted by per-window count normalized to `[0, 1]`. Rebuilt by walking `mentions` edges within configurable time windows.
+- **Reinforcement counts per Claim / Preference.** For each Claim or Preference, the count of inbound observation edges (and earliest / latest timestamps). Stored as a sidecar index.
+- **Current-truth index for relationships.** For each `(holder, target)` pair, the latest preference observation (by TimeAnchor ordering). Used by recall to answer "what does X currently think about Y."
+- **Change-event nodes.** When current-truth flips for a `(holder, target)` (e.g., Alice was `likes` pizza, now `dislikes`), emit a synthetic ChangeEvent node with `temporal_at` edges to both the old and new TimeAnchors. Lets recall answer "when did X change their mind about Y."
+- **Episodic clusters.** Group granules by `(entity, topic, time-window)`; emit an EpisodicNode per cluster with `cluster_of` edges to its member granules.
+- **`temporal_before` / `temporal_after` between TimeAnchors.** Derived from the sorted set of TimeAnchors.
+
+Derived data carries its own fingerprint: `(ingestion_fingerprint, derivation_config_fingerprint)`. Derived rebuild is idempotent. If primary hasn't changed since the last rebuild, recall reuses the existing derived snapshot.
+
+---
+
+## 5. Node and edge schema (concrete)
+
+### Identity functions
 
 ```python
-node.labels = frozenset({"claim", "preference"})
+def node_id(identity: dict[str, object]) -> str:
+    """sha256(sorted-key JSON of identity).hex[:16]"""
 ```
 
-Per-label payloads are merged onto the same node's attribute dict, namespaced by label:
+| Node type | Identity fields | Layer label(s) | Granularity label |
+|---|---|---|---|
+| Memory | `(memory_index)` (monotonic per instance) | — | — |
+| Turn (granule) | `(memory_id)` — same as the Memory's `memory_index`-derived ID | `semantic` | `turn` |
+| Sentence | `(turn_id, sentence_index)` | `semantic` | `sentence` |
+| N-gram | `(sentence_id, ngram_kind, normalized_text)` (`ngram_kind` in `noun_chunk | svo`) | `semantic` | `ngram` |
+| Entity | `(canonical_form, entity_type)` | `entity` | — |
+| Claim | `(subject_id, predicate, object_id_or_literal)` | `relationship` | — |
+| Preference | `(holder_id, polarity, target_id_or_literal)` | `relationship` | — |
+| TimeAnchor | `(iso_timestamp_rounded)` | `temporal` | — |
+| EpisodicNode (derived) | `(entity_id, topic_signature, time_window_start, time_window_end)` | `episodic` | — |
+| ChangeEvent (derived) | `(holder_id, target_id, time_anchor_id, old_polarity, new_polarity)` | `relationship`, `temporal` | — |
+
+### Frozen payloads
+
+All payload dataclasses are `@dataclass(frozen=True, slots=True)`. Same convention as the Tier-1 codebase.
 
 ```python
-G.add_node(
-    node_id,
-    labels=frozenset({"claim", "preference"}),
-    claim=ClaimPayload(subject_id=..., predicate="likes", object_id=...),
-    preference=PreferencePayload(holder_id=..., polarity="likes"),
-)
-```
+@dataclass(frozen=True, slots=True)
+class MemoryPayload:
+    memory_index: int
+    content: str
+    timestamp: str | None
+    speaker: str | None
+    source: str | None
+    metadata: tuple[tuple[str, str], ...]   # sorted for R2
 
-This matches the manifesto's "heterogeneous, multi-labeled graph" (§3) and keeps `(labels, payloads)` co-located without proliferating `is_same_as` edges.
-
-### Node payloads (frozen dataclasses)
-
-All payload dataclasses are `@dataclass(frozen=True, slots=True)`. The graph wrapper holds mutability; the payloads do not. This matches `engram.models` conventions (see [engram/models.py](../../engram/models.py)).
-
-```python
 @dataclass(frozen=True, slots=True)
 class TurnPayload:
-    speaker: str
-    text: str
-    conversation_id: str
-    session_index: int
-    turn_index: int
-    timestamp: str | None  # ISO-8601 if present in source; never wall-clock
+    memory_id: str
 
 @dataclass(frozen=True, slots=True)
-class UtteranceSegmentPayload:
+class SentencePayload:
     text: str
     turn_id: str
-    segment_index: int
-    char_span: tuple[int, int]  # offsets into Turn.text
+    sentence_index: int
+    char_span: tuple[int, int]
+
+@dataclass(frozen=True, slots=True)
+class NgramPayload:
+    normalized_text: str
+    surface_form: str
+    sentence_id: str
+    ngram_kind: str            # "noun_chunk" | "svo"
+    char_span: tuple[int, int]
 
 @dataclass(frozen=True, slots=True)
 class EntityPayload:
     canonical_form: str
-    entity_type: str            # PERSON | ORG | GPE | ARTIFACT | CONCEPT | ...
-    aliases: tuple[str, ...]    # deterministic: sorted
+    entity_type: str
+    # aliases NOT stored here — derived from `mentions` edges
 
 @dataclass(frozen=True, slots=True)
 class ClaimPayload:
-    subject_id: str             # Entity node id
-    predicate: str              # normalized verb/relation
-    object_id: str | None       # Entity node id; None for intransitive
-    object_literal: str | None  # for "I am 42" where object is a value, not an entity
-    asserted_by_turn_id: str
-    asserted_at: str | None     # ISO-8601, resolved at ingest (R8)
-    modality: str               # asserted | negated | hypothetical | interrogative
-    tense: str                  # past | present | future | habitual
+    subject_id: str
+    predicate: str
+    object_id: str | None
+    object_literal: str | None
 
 @dataclass(frozen=True, slots=True)
 class PreferencePayload:
-    holder_id: str              # Entity node id, usually the speaker
-    polarity: str               # likes | dislikes | wants | avoids | commits_to | rejects
+    holder_id: str
+    polarity: str              # likes | dislikes | wants | avoids | commits_to | rejects
     target_id: str | None
     target_literal: str | None
-    source_claim_id: str        # the Claim this Preference overlays
-    confidence: float           # centroid-discrimination score; gated by R6 threshold
 
 @dataclass(frozen=True, slots=True)
-class EventPayload:
-    canonical_description: str
-    interval_start: str | None  # ISO-8601
-    interval_end: str | None    # ISO-8601
-    participant_ids: tuple[str, ...]  # Entity node ids, sorted
+class TimeAnchorPayload:
+    iso_timestamp: str         # rounded to configured resolution
 
 @dataclass(frozen=True, slots=True)
-class EpisodePayload:
-    conversation_id: str
-    cluster_id: int             # deterministic from member turn ids
-    member_turn_ids: tuple[str, ...]  # sorted
-    summary: str | None         # optional; set only if the LLM-enhancement layer is enabled
+class EpisodicNodePayload:
+    entity_id: str
+    topic_signature: str       # short stable digest of the topic centroid
+    time_window_start: str
+    time_window_end: str
+    member_granule_count: int
 
 @dataclass(frozen=True, slots=True)
-class SessionPayload:
-    conversation_id: str
-    session_index: int
-    timestamp: str | None
+class ChangeEventPayload:
+    holder_id: str
+    target_id: str
+    time_anchor_id: str
+    old_polarity: str
+    new_polarity: str
 ```
 
-### Edges
+Note that `EntityPayload` no longer carries `aliases`. Aliases are a derived index. Same for `Claim` / `Preference` reinforcement counts — derived, not on the node.
 
-A `MultiDiGraph` with typed edges. Edge identity is the triple `(src, dst, key)` where `key` is the edge type. Attributes:
+### Edge attrs
 
 ```python
 @dataclass(frozen=True, slots=True)
 class EdgeAttrs:
-    type: str                          # edge-type identifier from the reference table below
-    weight: float = 1.0                # evidence strength, normalized to [0, 1]
-    source_turn_id: str | None = None  # which Turn introduced this edge (provenance)
-    asserted_at: str | None = None     # ISO-8601 when relevant (supports/contradicts/etc.)
+    type: str                              # primary or derived edge type
+    weight: float = 1.0                    # evidence strength in [0, 1]
+    source_memory_id: str | None = None    # which Memory this observation came from
+    source_granule_id: str | None = None   # the most-specific granule (Sentence or N-gram) that generated this edge
+    asserted_at: str | None = None         # ISO-8601 (TimeAnchor's timestamp)
 ```
 
-`weight` here is the edge's *evidence strength* — how strongly the corpus supports the relation — normalized to `[0, 1]` with per-edge-type semantics documented below. It is **not** the recall-time weight used during subgraph expansion; that lives in a per-intent weight vector at recall-planning (see "Recall-side weight optimization" below).
-
-Parallel edges of different `type` between the same pair are valid (Claim → Entity can be both `mentions` and `about`). Parallel edges of the *same* type are not — add-edge upserts, accumulating evidence into `weight` where appropriate (e.g. `co_occurs_with`).
-
-#### Extraction-cost-driven tiering
-
-Manifesto §3 enumerates an aspirational edge inventory (twelve types). Not all ship on day one. The filter for inclusion is *extraction cost*, not *recall utility* — weight optimization handles recall-side relevance automatically. If extraction is cheap and deterministic, ship the edge; the optimizer can drive its recall weight toward zero for intents that don't benefit. If extraction requires semantic reasoning (entailment, anaphora, paraphrase), R5 defers it.
-
-Rationale: the marginal *recall-side* cost of a speculative edge type collapses under automated weight optimization (one extra scalar in a ~50-dimensional search space). The marginal *ingest-side* cost does not — each edge type demands a deterministic extractor, R2 audit, R3 fingerprint coupling, and serialization schema. So the right filter is "cheap to extract", not "proven to help recall."
-
-**Tier 1 — cheap deterministic extraction; shipped with the first ingestion PR.**
-
-| Edge | From → To | Extraction | Weight semantics |
-|---|---|---|---|
-| `part_of` | Turn → Session, UtteranceSegment → Turn | structural, direct from inputs | 1.0 (structural) |
-| `mentions` | Turn → Entity, Claim → Entity | NER + canonicalization | 1.0 (presence) |
-| `asserts` | Turn → Claim | dependency-parse SVO extraction | 1.0 (presence) |
-| `holds_preference` | Entity[speaker] → Preference | Preference detector output + Turn.speaker | Preference detector confidence, rescaled to [0, 1] |
-| `about` | Claim → Entity, Preference → Entity | Claim.object_id / Preference.target_id | 1.0 (presence) |
-| `co_occurs_with` | Entity ↔ Entity (bidirectional) | entity-pair counting per conversation | count normalized by max-pair-count in conversation |
-| `temporal_before` / `temporal_after` | Turn → Turn (Turn level only) | from `(session_index, turn_index)` ordering; free | 1.0 (ordinal) |
-
-Seven edge types. All deterministic, all extractable from NER + dependency parses + counts + ordering. No LLM, no semantic reasoning at ingest.
-
-**Tier 2 — unlocked by first-class Event / Episode node detection.**
-
-| Edge | From → To | Unlocked by |
-|---|---|---|
-| `during` | Claim → Event, Event → Session | Event extraction |
-| `part_of` | Turn → Episode | Episode clustering |
-| `temporal_before` / `temporal_after` | Event → Event | Event extraction |
-
-Promotion gate: Event and Episode node extraction landing as a separate design-doc iteration, with their own determinism and discrimination validation. These edges come "for free" once the nodes exist.
-
-**Tier 3 — requires semantic reasoning at ingest (R5 pressure).**
-
-| Edge | From → To | Why deferred |
-|---|---|---|
-| `supports` | Claim ↔ Claim, Claim ↔ Preference | entailment detection — NLI model or LLM |
-| `contradicts` | Claim ↔ Claim, Claim ↔ Preference | same |
-| `refers_back_to` | Turn → Turn | anaphora / coreference resolution |
-
-Promotion gate: an M1 hypothesis tying a diagnosed bucket gap to the structure these edges would provide, **plus** a deterministic (non-LLM) extractor validated above noise on a held-out set. Until then, conflict detection at recall (manifesto §3.Recall) operates over claim target overlap without explicit edges.
-
-#### Recall-side weight optimization
-
-Per-intent edge weights are parameters to optimize, not hand-tune. Shipping an edge is a commitment to extract it; shipping a *weight* for it is a commitment to a hypothesis.
-
-- **Objective.** `needle_recall@k` on oracle-annotated questions (LME-s `answer_session_ids`, LOCOMO equivalent), per intent.
-- **Search space.** Per-intent edge-type weight vector (~5 intents × ~7 Tier-1 edges ≈ 35 scalars), plus walk depth, frontier size, and seed-count-per-intent. ~50 scalars at Tier-1 scope.
-- **Strategy.** Black-box optimization (Optuna / CMA-ES) against the oracle. LLM-free — minutes on LME-s.
-- **Gate (M4 discipline).** `needle_recall@k` improvements can regress full-benchmark accuracy (see [lessons 2026-04-20](../../.agent/lessons.md)). Optimized weights ship through the same replicate + pp-threshold gate as any other change. Optimize on dev; validate on the full benchmark.
-- **Infrastructure owner.** Diagnostics (`needle_overlap`; manifesto §6 Diagnostics verbs). The optimizer is a thin wrapper.
-
-When a Tier 2 or Tier 3 edge type is promoted, its weight enters the search space on the next optimization run. No manual weight-setting beyond an initial sensible guess.
-
-### Timestamps
-
-- ISO-8601 strings throughout, always timezone-aware when source provides one, always explicit about when it does not (field is typed `str | None`).
-- No naive `datetime` objects in payloads. No `datetime.now()`.
-- Temporal arithmetic (R8) happens at ingest or recall-planning and stores resolved absolute strings on Event / Claim payloads. The answerer never sees relative expressions.
-- Dataset-provided timestamps (e.g. LongMemEval's `question_date`, `haystack_dates`) are the source of truth; missing values stay `None`.
-
-### Frozen vs. mutable
-
-- **Payloads are frozen.** No hidden mutation.
-- **The `MultiDiGraph` is mutable during ingest.** `finalize_conversation(conversation_id)` sets a `frozen: bool` flag on the conversation's `GraphStore` wrapper; subsequent writes raise `GraphFrozenError`. This enforces the ingest→finalize→read lifecycle that recall depends on.
-- **Saved state is immutable.** `save_state` writes a content-hashed filename (`{answer_fingerprint}.msgpack`) alongside a manifest; `load_state` verifies the hash on read.
-
-### Schema versioning (R12)
-
-A single `SCHEMA_VERSION: Final[int] = 1` constant in `engram.ingestion.persist`. The version increments whenever:
-
-- Any payload dataclass gains or loses a field.
-- Any edge type is added or removed.
-- Identity-field lists change (would rewrite every node ID).
-
-Every persisted file carries `{"schema_version": N, ...}` as its first key. Load paths:
-
-- Exact match → load.
-- Older version → raise `SchemaVersionMismatch(have=N, found=M)` with a message pointing to a migration tool. Migrations are separate PRs with their own tests; they never run implicitly.
-- Newer version → same error. No silent downgrade.
-
-This is the R12 contract, stated in ≤20 lines of Python.
-
-### Ingestion fingerprint coupling (R3)
-
-Every config field that influences node/edge *production* — model identifiers, segmentation rules, canonicalization thresholds — lives in `MemoryConfig._INGESTION_FIELDS` (see [engram/config.py](../../engram/config.py)). The `SCHEMA_VERSION` is also part of the ingestion fingerprint: a schema bump invalidates every persisted graph, even if config is otherwise unchanged.
-
-The existing fingerprint-discipline test (`tests/test_fingerprint_discipline.py`) already catches forgotten fields. A new ingest-determinism test will catch "field categorized but iteration is unstable" bugs where the fingerprint matches but bytes differ.
+`source_memory_id` is the provenance anchor — every primary edge traces to exactly one Memory, supporting the time-travel and attribution properties from P12.
 
 ---
 
-## 3. Extraction Pipeline
+## 6. Extraction pipeline (deterministic, no LLM)
 
-A linear sequence. Each stage consumes its predecessor's output and emits nodes / edges onto the `MultiDiGraph`. Stage order mirrors manifesto §3.
+Per-Memory, in order. Each stage consumes its predecessor's output and emits nodes / edges.
 
 ```
-Session + Turns (input)
-    │
-    ▼
-[1] Segmentation            → UtteranceSegment nodes + part_of edges
-    │
-    ▼
-[2] NER                     → entity mentions (text spans; not yet nodes)
-    │
-    ▼
-[3] Canonicalization        → Entity nodes (deduplicated) + mentions edges
-    │
-    ▼
-[4] Claim extraction        → Claim nodes + asserts edges + about edges
-    │
-    ▼
-[5] Preference detection    → Preference labels on Claim nodes (fails-closed)
-    │                          + holds_preference + about edges
-    ▼
-[6] Co-occurrence           → co_occurs_with edges (at finalize)
+Memory (ingest input)
+  │
+  ▼
+[1] Memory node + Turn node + part_of (Turn → Memory)
+  │
+  ▼
+[2] Sentence segmentation       → Sentence nodes + part_of (Sentence → Turn)
+  │
+  ▼
+[3] N-gram extraction           → N-gram nodes + part_of (N-gram → Sentence)
+  │
+  ▼
+[4] NER                         → entity mentions (text spans)
+  │
+  ▼
+[5] Entity canonicalization     → Entity nodes + mentions edges
+  │
+  ▼
+[6] Claim extraction            → Claim nodes + asserts edges + about edges
+  │
+  ▼
+[7] Preference detection        → Preference nodes (fails closed) + holds_preference + about
+  │
+  ▼
+[8] Granule embedding           → vector index update (Turn, Sentence, N-gram embeddings)
+  │
+  ▼
+[9] Temporal anchoring          → TimeAnchor node + temporal_at edges
+                                  (from Turn, Sentence, N-gram, Claim, Preference)
 
-finalize_conversation:
-    - co-occurrence edge emission across the full conversation
-    - temporal_before / temporal_after at Turn level (from indexes)
-    - GraphStore.freeze()
+(rebuild_derived runs lazily before recall, or explicitly:)
+[D1] Co-occurrence edges        (rewrite)
+[D2] Alias sets                 (rewrite)
+[D3] Reinforcement counts       (rewrite)
+[D4] Current-truth index        (rewrite)
+[D5] Change-event nodes         (rewrite)
+[D6] Episodic clusters          (rewrite)
+[D7] Temporal_before / after between TimeAnchors  (rewrite)
 ```
 
-### [1] Segmentation
+### Per-stage notes
 
-- **Algorithm.** spaCy `Doc.sents` with dependency-parse-aware boundary detection.
-- **Why not regex.** R6 — surface-pattern boundaries overfit to dataset phrasings.
-- **Input.** `Turn.text`.
-- **Output.** `UtteranceSegmentPayload(text, turn_id, segment_index, char_span)`, left-to-right `segment_index`.
-- **Determinism.** spaCy CPU tokenizer / parser is bit-stable.
-- **Fails closed.** A turn producing zero segments (empty / punctuation-only) emits no UtteranceSegment nodes; the Turn still exists.
+**[1] Memory + Turn.** Memory node carries the ingest payload; Turn node is a granule shadow that participates in the granularity hierarchy and gets its own embedding (the whole-Memory representation).
 
-### [2] NER
+**[2] Segmentation.** spaCy `Doc.sents` with dependency-parse-aware sentence boundaries. Empty / whitespace-only sentences dropped (fails closed).
 
-- **Algorithm.** spaCy pipeline NER over the Doc.
-- **Batching.** Accumulate all Turns in a session; process via `Language.pipe` at the end of `ingest_session`. Batch sizes 20–50.
-- **Output.** Entity mentions — `(surface_form, entity_type, char_span, turn_id)` tuples. Not yet Entity nodes.
-- **Determinism.** CPU-deterministic. GPU mode covered by R14 budget (§7).
+**[3] N-gram extraction.** Two extractors run side-by-side:
+- `noun_chunk` extractor: `doc.noun_chunks`, normalized to lowercase NFKC, dropped if all stop words or below 2 tokens.
+- `svo` extractor: walk the dependency parse, emit a phrase per (subject, root verb, object) triple — stable text rendering that's stable under R2.
 
-### [3] Entity canonicalization
+Each n-gram becomes a node; `part_of` from N-gram to its containing Sentence.
 
-Full algorithm in §6. Pipeline summary:
+**[4] NER.** spaCy NER over the Doc. Mention spans extracted with surface form + entity type + char span.
 
-- **Input.** Entity mentions from [2].
-- **Output.** Entity nodes (one per canonical form) + `mentions` edges from Turns.
-- **Fails closed.** Mentions that don't meet the clustering threshold are dropped; no "pending" state.
+**[5] Entity canonicalization.** Tier-1 algorithm: NFKC + casefold + `rapidfuzz.token_set_ratio` against existing entities of the same type. Threshold default 0.85. Same content → same Entity node ID (content-addressed). Tie-breaking: `(higher similarity, alphabetical canonical_form, lexicographic node_id)`. Feature infrastructure wired for embedding similarity + co-occurrence with weights = 0; enabled later under M1 hypotheses.
 
-### [4] Claim extraction
+**[6] Claim extraction.** SVO triples from dependency parses. Subject = `nsubj` subtree (resolved to Entity or first-person → speaker Entity). Predicate = `lemma_` of root verb. Object = `dobj` / `attr` / `pobj` subtree (resolved to Entity or held as `object_literal`). Modality + tense from spaCy morph features. Fails closed if subject can't be resolved.
 
-- **Algorithm.** Over each UtteranceSegment's dependency parse, extract `(subject, predicate, object)` triples:
-  - `subject` = subtree under the `nsubj` token, resolved to a canonical Entity if possible.
-  - `predicate` = lemma of the `ROOT` verb.
-  - `object` = subtree under `dobj` / `attr` / `pobj`, resolved to a canonical Entity or held as `object_literal`.
-- **Tense / modality.** From spaCy morph features (`VerbForm`, `Tense`, `Mood`).
-- **Speaker attribution.** Inherited from `Turn.speaker`.
-- **Output.** `ClaimPayload` + `asserts` edge (Turn → Claim) + `about` edge (Claim → Entity) for each entity in subject / object.
-- **Fails closed.** No identifiable subject **or** no predicate → no Claim. Literals (numbers, dates, quoted strings) go in `object_literal` when no Entity resolves.
+**[7] Preference detection.** Prototype-centroid classifier per polarity. Fails closed below per-polarity discrimination margin. Synthetic seeds + held-out validation as in the Tier-1 implementation. Detail in §8.
 
-### [5] Preference detection
+**[8] Granule embedding.** MiniLM (`all-MiniLM-L6-v2`) for all granules — Turn, Sentence, N-gram. Each embedding stored in the parallel vector index keyed by node ID. Embedding is also persisted on the node attrs for recovery if the index is lost.
 
-Full protocol in §5. Pipeline summary:
+**[9] Temporal anchoring.** TimeAnchor node for the Memory's timestamp (rounded to configured resolution). `temporal_at` edges from Turn / Sentence / N-gram / Claim / Preference observations to the TimeAnchor.
 
-- **Input.** Each Claim from [4].
-- **Classifier.** Prototype-embedding centroids per polarity, computed from hand-authored synthetic seeds.
-- **Output.** `PreferencePayload` co-located on the same node as the parent Claim (multi-label `{claim, preference}`), plus `holds_preference` edge from the speaker Entity and `about` edge to the target.
-- **Fails closed.** Below-margin Claims remain pure Claims. SSP accuracy depends entirely on prototype quality — see §5.
+### Cross-cutting fails-closed policy
 
-### [6] Co-occurrence (corpus signal)
-
-- **Algorithm.** Per-conversation entity-pair counter. Within each Turn, every unordered pair of canonical Entity nodes increments a counter.
-- **Edge emission.** During `finalize_conversation`: emit bidirectional `co_occurs_with` edges, `weight = count / max_pair_count_in_conversation` — normalized to `[0, 1]` per §2 edge-weight rule.
-- **Pruning.** No hard count floor; the recall-time weight optimizer is responsible for ignoring thin edges.
-
-### Finalize-conversation passes
-
-1. Co-occurrence edge emission (above).
-2. `temporal_before` / `temporal_after` at Turn level, derived from `(session_index, turn_index)` — O(n) sorted pass over Turn nodes.
-3. `GraphStore.freeze()` — sets `frozen = True`; subsequent writes raise `GraphFrozenError`.
-
-### Fails-closed policy (cross-cutting)
-
-Every extractor obeys one rule: **emit nothing below the declared confidence threshold for its output node type.** No "partial" nodes, no "low-confidence" flags. Thresholds live in `MemoryConfig._INGESTION_FIELDS` and feed the ingestion fingerprint:
+Every extractor obeys: **emit nothing below the declared confidence threshold for its output node type.** Below-threshold output that slips through taints multi-Memory aggregation. Thresholds live in `MemoryConfig._INGESTION_FIELDS` and feed the ingestion fingerprint:
 
 - `canonicalization_match_threshold: float`
-- `claim_subject_required: bool = True`  (dependency parse must produce a resolved subject)
+- `claim_subject_required: bool = True`
 - `preference_discrimination_margin: float`
-
-Violating fails-closed is a correctness bug, not a quality knob. A below-threshold output that slips through taints multi-session-aggregation (P1, P3, R6).
+- `ngram_min_tokens: int = 2`
 
 ---
 
-## 4. Model Choices
+## 7. Derived rebuilds
 
-Three models feed ingestion. Each is a `MemoryConfig._INGESTION_FIELDS` entry — changing any bumps the ingestion fingerprint (R3) and every downstream answer (R4).
+`rebuild_derived()` is idempotent. Triggered lazily before recall if the primary fingerprint has advanced since the last rebuild, or explicitly by callers that want to batch.
+
+### D1 — Co-occurrence
+
+For each pair of Entity nodes, count co-occurrences within configurable time windows (default: per-Memory, plus per-1-hour and per-1-day windows). Emit `co_occurs_with` edges with `weight = count / max_pair_count_in_window`. One edge per (pair, window).
+
+### D2 — Alias sets
+
+For each Entity, walk inbound `mentions` edges. Collect distinct surface forms from the source granules. Store as `aliases: tuple[str, ...]` in a sidecar `derived/alias_index.msgpack`.
+
+### D3 — Reinforcement counts
+
+For each Claim and Preference node, count inbound observation edges and record `(count, earliest_observation, latest_observation)`. Stored in `derived/reinforcement_index.msgpack`.
+
+### D4 — Current-truth index
+
+For each `(holder_id, target)` pair (where target = `target_id` or `target_literal`), find the latest Preference observation by TimeAnchor ordering. Stored in `derived/current_preference_index.msgpack`. Recall consults this for "what does X currently think about Y" queries in O(1).
+
+### D5 — Change-event nodes
+
+When the current-truth index records a polarity flip for `(holder, target)` (e.g., `likes` → `dislikes`), emit a synthetic `ChangeEvent` node and `temporal_at` edges to both old and new TimeAnchors.
+
+### D6 — Episodic clusters
+
+Group granules by `(entity, topic_centroid, time_window)`:
+- For each Entity, gather granules that mention it.
+- Within those, cluster by topic (k-means on granule embeddings, k chosen by silhouette or elbow on a held-out fixture).
+- Within each topic cluster, group by time window (default: 1 day).
+- Emit one `EpisodicNode` per (entity, topic, window) with `cluster_of` edges to member granules.
+
+Episodic clustering is the most expensive derived step and may be tier-2 in implementation order.
+
+### D7 — Temporal-before / after between TimeAnchors
+
+Sort all TimeAnchor nodes by their ISO timestamp. Emit `temporal_before` / `temporal_after` edges between consecutive anchors. Lets recall walk forward/backward in time without scanning timestamps.
+
+### Rebuild fingerprint
+
+Derived snapshot fingerprint = `sha256(ingestion_fingerprint || derivation_config_fingerprint)`. Stored alongside the snapshot. Recall checks this on read; if mismatched, rebuild before serving.
+
+---
+
+## 8. Model choices
+
+Three models feed ingestion; each is a `MemoryConfig._INGESTION_FIELDS` entry.
 
 | Role | Model | `MemoryConfig` field | Rationale |
 |---|---|---|---|
-| NLP pipeline — segmentation, NER, dep parse, morph | `en_core_web_sm` | `spacy_model` | CPU-deterministic, ~12 MB, fast. Transformer variant (`_trf`, 400+ MB) deferred until NER quality is a diagnosed blocker — avoid speculative capability (P1) |
-| Topical embedding — seeding, co-occurrence weighting, canonicalization feature #2 | `all-MiniLM-L6-v2` | `embedding_model` | Predecessor default; 384-dim; well-characterized. Known limitation: collapses speech acts onto topic proximity (P5) — hence the separate preference-discrimination model below |
-| Preference discrimination | `all-mpnet-base-v2` | `preference_embedding_model` *(new)* | NLI-aware; discriminates assertion / negation / preference structure that MiniLM flattens. 768-dim. Ships day one per P5 + R10 |
+| NLP pipeline — segmentation, n-gram extraction, NER, dep parse, morph | `en_core_web_sm` | `spacy_model` | CPU-deterministic, ~12 MB, fast. Transformer variant deferred until NER quality is a diagnosed blocker. |
+| Granule embedding — semantic-layer indexing, claim / entity proximity | `all-MiniLM-L6-v2` | `embedding_model` | Predecessor default; 384-dim; well-characterized. Topical only — known to flatten speech acts (P5). |
+| Preference discrimination | `all-mpnet-base-v2` | `preference_embedding_model` | NLI-aware; discriminates assertion / negation / preference structure. 768-dim. |
 
-**New `MemoryConfig` field** (to add alongside the existing ones; the partition invariant catches forgetting this):
-
-```python
-preference_embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
-# _INGESTION_FIELDS |= {"preference_embedding_model"}
-```
-
-**Upgrade criteria.** A model swap requires an M1 hypothesis (target bucket, expected pp delta) and passes the K6 replicate gate. The fingerprint-discipline test catches forgotten categorizations automatically.
-
-**Not added in Tier 1.** Cross-encoder reranker (lives in Recall). Coreference resolver (upgrades §6; non-trivial without an LLM).
+Model swaps require an M1 hypothesis (target bucket, expected pp delta) and pass the K6 replicate gate. The fingerprint-discipline test catches forgotten categorizations automatically.
 
 ---
 
-## 5. Preference-Detection Validation Protocol
+## 9. Preference-detection validation protocol
 
-SSP is the lower of the two red buckets (16.7% on the predecessor). Preference detection is the single Tier-1 mechanism pointed at it. This section specifies how to get it right without contaminating the benchmark (M3, M4, P8).
+Unchanged in spirit from the Tier-1 doc; restated here for completeness.
 
 ### Prototype centroid construction
 
 For each polarity in `{likes, dislikes, wants, avoids, commits_to, rejects}`:
-
-- **Seeds.** 10–20 hand-authored synthetic sentences per polarity (≈ 60–120 total). Sentences are speaker-agnostic ("I love spicy food" / "I avoid early meetings") and vary in surface form, tense, and intensity.
-- **Centroid.** `mean(preference_embed(seed_i))` — mean-pool of seed embeddings per polarity.
-- **Storage.** Precomputed, source-controlled at `engram/ingestion/preferences/centroids.json` (seeds + computed centroids). The seed-file content hash enters `MemoryConfig` as `preference_seed_hash: str` — in `_INGESTION_FIELDS`, so editing seeds invalidates the ingestion fingerprint (R3).
+- 10–20 hand-authored synthetic seed sentences per polarity (~60–120 total). Speaker-agnostic, varied in surface form / tense / intensity.
+- Centroid = `mean(preference_embed(seed_i))` per polarity. L2-normalized.
+- Stored at `engram/ingestion/preferences/seeds.json`. The file's content hash enters `MemoryConfig.preference_seed_hash` (R3 — editing seeds invalidates the ingestion fingerprint).
 
 ### Held-out discrimination measurement
 
-- **Held-out set.** 30–60 hand-authored sentences across the same six polarities, constructed *separately* from the training seeds. Lives at `engram/ingestion/preferences/heldout.json`. **Never drawn from LongMemEval or LOCOMO questions.**
-- **Metric.** For each held-out sentence with true polarity p:
+- 30–60 hand-authored sentences across the same polarities, **disjoint from the training seeds and never drawn from LME-s / LOCOMO** (P8, M3, M4).
+- Stored at `engram/ingestion/preferences/heldout.json`.
+- Per-sentence: `margin = cos(sentence, centroid_p) - max_{q != p} cos(sentence, centroid_q)`.
+- Per-polarity: median margin must clear `MemoryConfig.preference_discrimination_margin` for that polarity to emit Preferences. Polarities below the gate fail closed (no Preferences of that polarity emitted anywhere).
 
-  ```
-  margin(sentence) = cos(sentence, centroid_p) - max(cos(sentence, centroid_q) for q ≠ p)
-  ```
+### Runtime gate
 
-- **Per-polarity gate.** Median `margin` must clear the discrimination threshold for that polarity to emit Preference nodes. Polarities that fail the gate fail closed for the whole corpus — no Preference-of-polarity-p nodes emitted anywhere.
-
-### Runtime threshold
-
-`MemoryConfig.preference_discrimination_margin: float = 0.05` — provisional; calibrated from held-out data before the first benchmark run.
-
-At ingest:
-
-```python
-for claim in claims:
-    e = preference_embed(claim.text)
-    scores = {p: cos(e, centroids[p]) for p in POLARITIES}
-    top_p = max(scores, key=scores.get)
-    second = max(scores[q] for q in POLARITIES if q != top_p)
-    margin = scores[top_p] - second
-    if margin >= preference_discrimination_margin and scores[top_p] >= min_centroid_score:
-        emit_preference(claim, polarity=top_p, confidence=scores[top_p])
-    # else: fail closed — the Claim stands on its own
-```
-
-### Iteration discipline (M3 / M4 / P8)
-
-- Held-out set is **never** populated from LongMemEval or LOCOMO questions. Contamination risk is zero.
-- When the detector misses on real SSP cases (diagnosed via `extraction_miss` in R15), iterate on **seeds**, not on thresholds, and **only using the detector's own outputs** on the held-out set — never LME-s gold labels.
-- Each iteration is an M1 hypothesis: "adding seeds X, Y to polarity p will raise held-out median margin by ≥ ε without regressing other polarities." The hypothesis carries to the benchmark PR as its pp-delta target.
-
-### Known Tier-1 limitation
-
-If the synthetic distribution doesn't match real LME-s SSP phrasings, the detector fails closed and SSP stays near 16.7% baseline. That is correct behavior — R6 forbids emitting low-confidence structure. The fix is better seeds, not a looser threshold.
+`preference_discrimination_margin: float = 0.05` (provisional; calibrated from held-out before the first benchmark run).
 
 ---
 
-## 6. Entity Canonicalization
+## 10. Entity canonicalization
 
-Multi-session-aggregation depends on entity identity across sessions. "Alice" in session 1 and "Alice" in session 5 must resolve to the same Entity node. Tier 1 ships a minimum-viable canonicalizer and the architectural infrastructure for feature expansion.
-
-### Minimum-viable algorithm (first PR)
-
-String similarity only, with Unicode-normalized lowercasing.
+Tier-1 algorithm; extends naturally under the new architecture.
 
 ```python
-def canonicalize(mention, existing_entities_by_type):
+def canonicalize(mention, entity_index):
     normalized = unicodedata.normalize("NFKC", mention.surface_form).casefold().strip()
-    same_type = existing_entities_by_type.get(mention.entity_type, {})
+    same_type = entity_index.by_type[mention.entity_type]
 
-    # 1. Exact normalized match
+    # 1. Exact normalized match.
     if normalized in same_type.by_normalized_form:
         return same_type.by_normalized_form[normalized]
 
-    # 2. Above-threshold fuzzy match (token_set_ratio)
+    # 2. Above-threshold fuzzy match (token_set_ratio).
     best = max(
         same_type.values(),
         key=lambda e: token_set_ratio(normalized, e.normalized_form),
         default=None,
     )
-    if best and token_set_ratio(normalized, best.normalized_form) >= canonicalization_match_threshold:
-        return best  # merge; add mention.surface_form as alias
+    if best and token_set_ratio(normalized, best.normalized_form) >= threshold:
+        return best  # link mention as new edge; no payload mutation
 
-    # 3. New Entity node (fails-closed if type is missing)
-    return Entity.new(canonical_form=normalized, entity_type=mention.entity_type, ...)
+    # 3. New Entity node (content-addressed by (normalized, entity_type)).
+    return Entity.new(canonical_form=normalized, entity_type=mention.entity_type)
 ```
 
-- **Similarity.** `rapidfuzz.fuzz.token_set_ratio` — token-set Jaccard; handles word-order shuffles and partial matches.
-- **Threshold.** `MemoryConfig.canonicalization_match_threshold: float = 0.85` — provisional; calibrated on a synthetic fixture.
-- **Entity-type gate.** Canonicalization only merges within identical `entity_type` (PERSON ↔ PERSON; ORG ↔ ORG). Prevents "Apple" the company colliding with "apple" the food.
-- **Determinism.** Tie-breaking is a strict total order: `(higher similarity, alphabetical canonical_form, lexicographic node_id_hash)`. R2-compliant under any insertion order.
+Threshold default: `MemoryConfig.canonicalization_match_threshold = 0.85`. Tie-breaking: `(higher similarity, alphabetical canonical_form, lexicographic node_id)`. Type gate prevents "Apple" the company from colliding with "apple" the food.
 
-### Feature infrastructure — wired, disabled
+Feature infrastructure wired for embedding similarity + co-occurrence as additional features at weight 0; future PR with M1 hypothesis enables them.
 
-The canonicalization function takes a weighted feature vector even in Tier 1:
-
-```python
-SIMILARITY_WEIGHTS = {
-    "string":        1.0,   # Tier 1: the only feature used
-    "embedding":     0.0,   # wired; enabled in a future PR with M1 hypothesis
-    "co_occurrence": 0.0,   # wired; enabled in a future PR with M1 hypothesis
-}
-```
-
-Ship the infrastructure, keep non-string weights at zero. A future PR proposes non-zero weights with measured bucket-impact evidence. Commits the architectural shape without committing the extraction complexity.
-
-### Known Tier-1 limitations (explicit)
-
-- **Pronoun coreference** ("my sister" → "Alice") not handled. Requires embedding-sim + dialogue-context resolution. Diagnosed as `extraction_miss` in R15; addressed in a later PR with its own hypothesis.
-- **Nicknames** ("Bob" vs. "Robert") not handled unless string-similar enough to cross the threshold. Same diagnostic path.
-- **Cross-conversation entity sharing.** Tier-1 canonicalization is per-conversation. Two conversations that each mention "Alice" produce two distinct Entity nodes. Cross-conversation sharing is out of LME-s scope and deferred.
+**Pronoun coreference** ("my sister" → "Alice") not handled in v1. Diagnosed as `extraction_miss` in R15; addressed in a later PR.
 
 ---
 
-## 7. Operational Policy
+## 11. Operational policy
 
-Cross-cutting policy pinned by rule.
+**Async execution model (R1).** Protocol verbs are `async`. Implementation wraps synchronous model calls via `asyncio.to_thread`. No intra-instance concurrency.
 
-**Async execution model (R1).** Protocol verbs are `async` (contract). Implementation is synchronous model calls wrapped via `asyncio.to_thread`. Parallelism is at the `MemorySystem`-instance level — the external benchmark runs conversations in parallel with separate instances. No intra-instance concurrency.
-
-**Float-determinism budget (R14, K6).** Commit-to-commit FP drift budget: **±2pp** on the full LME-s benchmark. Provisional — validated after the first three commits produce replicate statistics; loosened to predecessor ±4pp only if empirics demand. Enforce:
-
+**Float-determinism budget (R14, K6).** Provisional ±2pp commit-to-commit. Enforced via:
 - `torch.use_deterministic_algorithms(True)` on model init.
 - `CUBLAS_WORKSPACE_CONFIG=:4096:8` at process start.
 - `PYTHONHASHSEED=0` for dict-order determinism.
-- All RNGs seeded from `MemoryConfig.random_seed: int = 0` (add to `_INGESTION_FIELDS`).
-- Accept residual CUDNN drift within budget.
+- All RNGs seeded from `MemoryConfig.random_seed: int = 0`.
 
 **Identity and version.**
 - `memory_system_id = "engram_graph"` — stable across patch versions; part of cache isolation.
-- `version = "0.1.0"` (semver). `MINOR` bumps on `SCHEMA_VERSION` bumps (§2); `PATCH` on implementation fixes.
+- `memory_version = "0.1.0"` (semver). `MINOR` bumps on `SCHEMA_VERSION` bumps; `PATCH` on implementation fixes.
 
-**Embedding storage.** Embedding vectors live as node attributes inside the graph msgpack. A sidecar file solves a non-existent problem — changing `embedding_model` bumps the ingestion fingerprint (R3/R4), which invalidates the graph anyway.
+**Embedding storage.** Vector matrix lives alongside the graph msgpack (`embeddings.npy` + `node_ids.json` sidecar files). Changing `embedding_model` bumps the ingestion fingerprint, invalidating the snapshot.
 
-**Batching boundary.** Per-`ingest_session`. Sessions are naturally ~5–50 turns — GPU-friendly. Batching at `finalize_conversation` would make K4 `ingest_session` latency meaningless.
+**Save-file layout.**
 
-**Save-file layout.** One msgpack per conversation at `save/<memory_system_id>/<ingestion_fingerprint>/<conversation_id>.msgpack`, plus a top-level manifest listing conversation IDs and their content hashes. Per-conversation files keep R2 audits local and scale with incremental work.
+```
+<save_path>/
+  manifest.json                       # memory_system_id, memory_version, schema_version,
+                                      # ingestion_fingerprint, derived_fingerprint
+  primary.msgpack                     # nodes + edges (append-only primary)
+  embeddings.npy                      # parallel vector index
+  node_ids.json                       # row-index → node_id mapping for embeddings.npy
+  derived/
+    alias_index.msgpack
+    reinforcement_index.msgpack
+    current_preference_index.msgpack
+    co_occurrence.msgpack
+    episodic.msgpack
+    timeanchor_chain.msgpack
+```
+
+`load_state` verifies `schema_version`, `memory_system_id`, and `ingestion_fingerprint`; rebuilds derived if `derived_fingerprint` is missing or mismatched.
 
 ---
 
-## 8. Dependencies & Test Strategy
+## 12. Patch path from current Tier-1
 
-### Runtime dependencies
+The Tier-1 implementation already shipped (`engram/ingestion/{schema,graph,persist,extractors,pipeline,factory}.py` + `engram_memory_system.py`). It uses `Session`/`Turn`/`conversation_id` as inputs and has `answer_question` as a stub. The architecture pivot doesn't require a rewrite — it requires a sequence of patches.
+
+**Patch 1 — protocol surface (smallest, highest priority).**
+- `MemorySystem` protocol: drop `answer_question`, drop `finalize_conversation`, drop `conversation_id` from all verbs. Add `recall(query, *, now, timezone, max_results)`. Rename `ingest_session(session, conversation_id)` → `ingest(memory)`.
+- `Memory` dataclass added to `engram/models.py`. `Session` and `Turn` retained as optional helper types (the benchmark may use them to build Memories), but no longer required by the protocol.
+- `EngramGraphMemorySystem`: adapt internal state to one-instance-one-memory; `reset` clears everything.
+- Fingerprint-discipline test updated.
+
+**Patch 2 — drop primary-data mutations (R16 enforcement).**
+- `EntityPayload.aliases` removed. Alias collection moves to derived.
+- Claim → Preference label-merging removed. Preferences become separate content-addressed nodes linked by `holds_preference` from the speaker entity.
+- Co-occurrence accumulator promoted to derived.
+
+**Patch 3 — add n-gram granularity.**
+- New `extractors/ngram.py` running `doc.noun_chunks` + a small dep-subtree SVO extractor.
+- New `NgramPayload` dataclass.
+- N-gram nodes + `part_of` edges from N-gram → Sentence in the pipeline.
+
+**Patch 4 — add granule embedding storage + parallel vector index.**
+- New `engram/ingestion/vector_index.py` wrapping the `numpy` matrix + node-id list.
+- Pipeline computes MiniLM embeddings for every granule (Turn, Sentence, N-gram) and inserts into the index.
+- `dump_conversation` / `load_conversation` rename → `dump_state` / `load_state`; vector index serializes alongside.
+- `SCHEMA_VERSION` bumps to 2.
+
+**Patch 5 — add layer labels.**
+- Each node gets a `layers: frozenset[str]` attribute populated by the extractor.
+- `GraphStore.nodes_by_layer(label)` helper for recall-side use.
+
+**Patch 6 — TimeAnchor + temporal layer.**
+- New TimeAnchor node + `temporal_at` edges from observations.
+- `temporal_before` / `temporal_after` between TimeAnchors moves to derived rebuild.
+
+**Patch 7 — derived-rebuild orchestrator.**
+- New `engram/ingestion/derived.py` with `rebuild_derived(state)`.
+- Co-occurrence, alias sets, reinforcement counts, current-truth index implemented.
+- ChangeEvent + EpisodicNode in a follow-up patch.
+- Lazy trigger: `recall` checks derived_fingerprint and rebuilds if stale.
+
+Each patch is its own PR with R3 fingerprint coverage, an R2 audit run, and at least one test exercising the new behavior.
+
+---
+
+## 13. Dependencies and tests
+
+### Runtime dependencies (pinned in pyproject.toml — already shipped)
 
 ```toml
-# pyproject.toml [project.dependencies]
 networkx              = ">=3.2,<4"
 msgpack               = ">=1.0,<2"
 spacy                 = ">=3.7,<4"
-sentence-transformers = ">=2.7,<3"
-numpy                 = ">=1.26,<2"
+sentence-transformers = ">=2.7,<6"
+numpy                 = ">=1.26,<3"
 httpx                 = ">=0.27,<1"
 rapidfuzz             = ">=3.9,<4"
 ```
 
-**Not pinned in pyproject.** spaCy language model `en_core_web_sm` and sentence-transformer weights — downloaded on first use (`python -m spacy download en_core_web_sm`; sentence-transformers auto-caches to `~/.cache/huggingface/`). Setup documented in `README.md`.
+`en_core_web_sm` and sentence-transformer weights are downloaded on first use and not pinned.
 
-### Test strategy — the R2 audit is the keystone
+### Test strategy
 
-| Test | What it proves | When |
+| Test | What it proves | Status |
 |---|---|---|
-| **Ingest determinism (R2 audit).** Ingest a synthetic 2-session corpus twice in one process, byte-compare serialized state | End-to-end determinism discipline | Every CI run. Non-negotiable. **Write this first.** |
-| Fingerprint coverage (existing `test_fingerprint_discipline.py`) | Every `MemoryConfig` field is categorized | Every CI run |
-| Per-extractor unit tests — segmentation, NER (mock), canonicalization, claim, preference | Each extractor deterministic on fixture input | Every CI run |
-| Integration — 2-session synthetic corpus → assert graph shape (node counts by label, edge counts by type, identity-invariant ordering) | Pipeline wiring works end-to-end | Every CI run |
-| Preference-detector held-out validation — median margin ≥ threshold on the shipped held-out set | Fails-closed gate calibration is correct | Every CI run, `slow`-marked |
-| Cross-process determinism — serialize from two separate Python processes with same seed; byte-compare | Catches process-global nondeterminism beyond R14 budget | Nightly / release; `slow`-marked |
-
-Predecessor lessons 2026-04-20 document a full day lost to FP non-determinism that passed unit tests but failed session-to-session. The R2-audit test exists so we don't repeat that.
-
-**Out of this module's test scope.** Full LongMemEval-s runs (external benchmark). Cross-encoder reranker (Recall). Answerer prompt (Recall).
+| **Ingest determinism (R2 audit).** Ingest a synthetic log of Memories twice in one process; byte-compare serialized state. | End-to-end determinism. **Write first.** | shipped (Tier-1) — extends to cover Memories |
+| Fingerprint coverage. Every `MemoryConfig` field is categorized. | R3 discipline. | shipped (Tier-1) |
+| Per-extractor units — segmentation, n-gram, NER (mock), canonicalization, claim, preference. | Each extractor deterministic on fixture input. | shipped for current set; n-gram pending |
+| Integration — synthetic log → assert graph shape per layer × granularity. | Pipeline wiring works end-to-end. | shipped; reshape under patch 1 |
+| Append-only invariants. Re-ingesting the same Memory content produces a new Memory node and only edges into existing primitives. | R16 enforcement. | new |
+| Derived idempotency. Rebuilding derived twice produces byte-identical output. | R17. | new |
+| Vector-index roundtrip. Save → load → identical embeddings + identical neighbor lookups. | Vector-index R12. | new |
+| Preference-detector held-out validation. Median margin ≥ threshold on shipped held-out set. | Fails-closed gate calibration. | shipped (slow-marked) |
+| Cross-process determinism. Serialize from two separate Python processes; byte-compare. | Catches process-global nondeterminism. | new (slow-marked) |
 
 ---
 
-## Open questions surfaced by this iteration
+## 14. Open questions
 
-- **Do we need a `labels` index on the graph for fast "all Preferences in this conversation" lookups?** Probably yes — it's how recall seeds typed subgraph walks. Could be a separate `dict[str, set[str]]` on the `GraphStore` wrapper, populated on add-node. Defer until recall-side traversal patterns firm up.
-- **Should `EdgeAttrs.source_turn_id` be multi-valued?** A `co_occurs_with` edge accumulates evidence from many turns. Options: single turn ID (loses evidence) vs. tuple of turn IDs (grows with weight) vs. drop the field on aggregate edges. Defer.
+- **TimeAnchor resolution.** Round to second / minute / hour? Default 1 second; revisit if anchor count explodes on long corpora.
+- **Episodic-cluster topic signature.** k-means on granule embeddings is the obvious choice; the topic_signature stored on the EpisodicNode needs to be a stable, R2-deterministic digest. Open: hash of cluster-centroid bytes vs. hash of member-granule IDs.
+- **Co-occurrence window definition.** Per-Memory + per-N-day? What N values? Default to {1 hour, 1 day, all-time}; revisit after first benchmark run.
+- **Reinforcement counts vs change events at recall.** A query "does Alice like pizza" — return current-truth node directly, or always include reinforcement count + change history? Defer to recall design.
 
-## Provisional values awaiting calibration
+---
 
-These defaults ship with the first PR but are explicitly provisional — re-baselined after the first benchmark replicate run.
+## 15. Provisional values awaiting calibration
+
+These defaults ship with the patches; explicitly provisional, re-baselined after the first benchmark replicate run.
 
 - `canonicalization_match_threshold = 0.85`
 - `preference_discrimination_margin = 0.05`
+- `ngram_min_tokens = 2`
+- TimeAnchor resolution = 1 second
+- Co-occurrence windows = `(1 hour, 1 day, all-time)`
 - Float-determinism budget = ±2pp
-- Preference seed file content (≈60–120 sentences across 6 polarities) — drafted as part of first-PR work.
-- Preference held-out file content (≈30–60 sentences) — drafted as part of first-PR work.

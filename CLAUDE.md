@@ -242,43 +242,47 @@ If you break something:
 
 ### What engram is
 
-A graph-based memory system for LLM agents. Measured against **LongMemEval** and **LOCOMO** by a separate `agent-memory-benchmark` repo, which consumes this package through the `MemorySystem` protocol. The binding design contract is [`docs/DESIGN-MANIFESTO.md`](docs/DESIGN-MANIFESTO.md) — read it before writing any code. The technical map is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+A graph-based memory system exposed as a tool to LLM agents. Engram never calls an LLM itself — an outside agent decides what to save (calling `ingest(memory)`) and when to query (calling `recall(query)`). The benchmark in [`agent-memory-benchmark`](https://github.com/rtuosto/agent-memory-benchmark) implements that outside agent and measures end-to-end accuracy on LongMemEval / LOCOMO. The binding design contract is [`docs/DESIGN-MANIFESTO.md`](docs/DESIGN-MANIFESTO.md) — read it before writing any code. The technical map is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ### North star
 
-**100% on LongMemEval-s 100q using `ollama:llama3.1:8b` as the answerer.** No paid APIs, no model swaps. The memory system alone closes the gap. Minimum acceptable for the rewrite: match/beat the predecessor's 76% with a credible path to 100%.
+**100% on LongMemEval-s 100q achieved by an outside agent powered by `ollama:llama3.1:8b`, with engram as the agent's memory tool.** No paid APIs, no model swaps. Engram itself makes zero LLM calls at any point. The benchmark implements the agent. Minimum acceptable for the rewrite: match/beat the predecessor's 76% with a credible path to 100%.
 
 ### Stack
 
 - Python 3.11+, `pyproject.toml`
-- Default answerer: Ollama `llama3.1:8b` (local, free)
-- Embeddings: sentence-transformers (model TBD in Ingestion)
-- NLP: spaCy for sentence splitting, NER, dependency parses (enables no-LLM-at-ingest discipline)
-- Storage: graph structure — implementation TBD, must satisfy R2 (determinism) and R12 (versioned persistence)
+- Outside answerer (in the benchmark, not engram): Ollama `llama3.1:8b` (local, free)
+- Embeddings: `all-MiniLM-L6-v2` for granule embeddings; `all-mpnet-base-v2` for preference centroids
+- NLP: spaCy `en_core_web_sm` for sentence splitting, n-gram extraction, NER, dependency parses (enables no-LLM-in-runtime discipline)
+- Graph storage: in-memory `networkx.MultiDiGraph` per instance + parallel `numpy` vector index for granule embeddings
+- Persistence: schema-versioned msgpack (R12)
 - Benchmarks: LongMemEval-s (primary, 100q split), LOCOMO (validation) — run from the external `agent-memory-benchmark` repo, not from this package.
 
 ### Three modules (strict boundaries)
 
-- **`ingestion/`** — sessions → graph. Owns segmentation, NER, canonicalization, claim/preference/event extraction, temporal resolution, edge construction, episode detection, corpus signals, ingestion fingerprint.
-- **`recall/`** — question → subgraph + context + 1 answerer call. Owns intent classification, seeding, expansion, ranking, assembly, answerer prompt.
+- **`ingestion/`** — Memories → graph. Owns segmentation, n-gram extraction, NER, entity canonicalization, claim/preference extraction, granule embedding + vector index, temporal anchoring, derived-index rebuilds (co-occurrence, alias sets, current-truth, change events, episodic clusters), ingestion fingerprint.
+- **`recall/`** — query → structured `RecallResult` for the outside agent. Owns intent classification, seeding (semantic + entity-anchored), bounded typed-edge expansion, walk scoring, output assembly with pre-computed facts. **No LLM calls.**
 - **`diagnostics/`** — failure classification (R15 enum), coverage reports, fingerprint audits. Read-only; never writes to caches or runtime path.
 
-**Benchmarking lives in `agent-memory-benchmark` (separate repo).** It consumes engram through the `MemorySystem` protocol — the only public surface. Never re-implement benchmark orchestration, dataset loading, or judge logic inside this repo.
+**Benchmarking + the answerer agent live in `agent-memory-benchmark` (separate repo).** It consumes engram through the `MemorySystem` protocol — the only public surface. Never re-implement benchmark orchestration, dataset loading, judge logic, OR the answerer agent inside this repo.
 
 ### Non-negotiables (excerpts from the manifesto)
 
-- **R1.** Single `MemorySystem` protocol. Only `ingest_session`, `finalize_conversation`, `answer_question`, `reset`, `save_state`, `load_state` are public.
-- **R3/R4.** Every config field that affects graph output is in `ingestion_fingerprint`; `answer_fingerprint` transitively includes it. Config diff without fingerprint diff is a bug.
-- **R5.** No LLM calls in the default ingestion path. LLM-based enhancements are opt-in, budget-capped, and the non-LLM path must always be fully functional on its own.
+- **R1.** Single `MemorySystem` protocol. Only `ingest`, `recall`, `reset`, `save_state`, `load_state` are public. **No conversation/session IDs in the API surface** — engram instances hold one memory.
+- **R3/R4.** Every config field that affects graph output is in `ingestion_fingerprint`; `recall_fingerprint` transitively includes it.
+- **R5.** No LLM calls in engram's runtime paths (ingest or recall). LLM-based enhancements are opt-in, behind a config flag, and measured separately. The non-LLM path must always be fully functional on its own.
 - **R6.** No English-specific regex for intent / speech-act classification. Prototype-embedding centroids with validated discrimination only.
-- **R8.** Temporal arithmetic happens at ingest or recall planning, never in the answer prompt.
-- **R9.** Retrieval returns a subgraph (nodes + justifying edges), not a flat list.
-- **R15.** Diagnostic classifier outputs are an enum: `extraction_miss | graph_gap | retrieval_miss | partial_retrieval | prompt_miss | answerer_miss`.
+- **R8.** Temporal arithmetic happens at ingest or recall planning, never in the recall output. The agent receives resolved absolute strings.
+- **R9.** Recall returns a structured `RecallResult` (passages + pre-computed facts + provenance), not an answer.
+- **R13.** Engram never produces answers, never constructs answer prompts, never calls LLMs. The benchmark agent does that.
+- **R15.** Diagnostic classifier outputs are an enum: `extraction_miss | graph_gap | retrieval_miss | partial_retrieval | output_miss | agent_miss`.
+- **R16.** Memories are append-only; content primitives (entities, claims, preferences, n-grams) are content-addressed; observations are edges. Counting and time-travel work via edge enumeration.
+- **R17.** Derived indexes (co-occurrence counts, alias sets, current-truth, change events, episodic clusters) are rebuildable, not mutable in place.
 
 ### Cost discipline
 
-- **No paid APIs** without explicit user approval. Default to Ollama for the answerer. The judge lives in the external benchmark repo — not a concern here.
-- **No LLM calls in the default ingestion path** (R5). Adding one requires an approved exception.
+- **No paid APIs** without explicit user approval. The benchmark uses Ollama; engram makes no LLM calls of its own.
+- **No LLM calls in engram's runtime paths** (R5, R13). Adding one requires an approved exception.
 
 ### Predecessor repo (reference only — do NOT copy)
 
@@ -289,7 +293,7 @@ Sibling project `agent-memory` is the reference codebase. Read for shape; no fil
 On every memory-affecting change:
 
 1. Write a hypothesis in `.agent/current-plan.md` (M1): target bucket, expected gain, mechanism, validation threshold, falsification condition.
-2. Classify the failure before coding (M5 decision tree): is the gap in extraction, retrieval, or prompt?
+2. Classify the failure before coding (M5 decision tree): extraction → retrieval → recall-output → agent. Fix the deepest broken layer.
 3. Run the per-commit scoreboard from DESIGN-MANIFESTO §K7 via the external `agent-memory-benchmark` repo against your branch.
 4. If claiming an improvement: 3 replicates if the delta is within ±4pp; 5 if within 2×.
 5. Every PR cites the rules(s) it implements or the hypothesis it tests.

@@ -4,96 +4,122 @@
 
 ## Overview
 
-Engram is a graph-based memory system for LLM agents. It converts a stream of conversation sessions into a heterogeneous, multi-labeled graph (nodes: Turn, Utterance Segment, Entity, Claim, Preference, Event, Episode, Session; edges: typed relations) and, given a question, retrieves a ranked subgraph that feeds a single-pass answerer (`ollama:llama3.1:8b`).
+Engram is a graph-based memory system exposed as a tool to LLM agents. An outside agent (an LLM with tool-calling) decides what to save (calling `ingest(memory)`) and when to query (calling `recall(query)`). Engram never calls an LLM itself.
 
-Measurement against **LongMemEval-s** (primary) and **LOCOMO** (validation) lives in the external [`agent-memory-benchmark`](https://github.com/rtuosto/agent-memory-benchmark) repo, which consumes this package through the `MemorySystem` protocol.
+The graph is heterogeneous and multi-labeled. It indexes ingested Memories at four granularities (Session, Turn, Sentence, N-gram) across five content layers (Episodic, Entity, Relationship, Temporal, Semantic). Primary data is append-only; derived indexes are rebuildable.
 
-**North star:** 100% on LongMemEval-s 100q with `llama3.1:8b`. No paid APIs. See [`DESIGN-MANIFESTO.md`](DESIGN-MANIFESTO.md) for the full principle set, design rules, KPIs, methodology, and verification gates.
+Measurement against **LongMemEval-s** (primary) and **LOCOMO** (validation) lives in the external [`agent-memory-benchmark`](https://github.com/rtuosto/agent-memory-benchmark) repo, which implements an LLM agent that uses engram as a recall tool — simulating production deployment.
+
+**North star:** an outside agent powered by `ollama:llama3.1:8b`, with engram as its memory tool, hits 100% on LongMemEval-s 100q. No paid APIs. Engram itself makes zero LLM calls. See [`DESIGN-MANIFESTO.md`](DESIGN-MANIFESTO.md) for the full principle set, design rules, KPIs, methodology, and verification gates.
 
 ## System Diagram
 
 ```
-  engram (this repo)
-  ───────────────────────────────────────────────────────────────────
+   agent-memory-benchmark (external repo)
+   ───────────────────────────────────────────────────────────────────
                   ┌────────────────────────────┐
-  Conversation ──▶│ ingestion/                 │──▶ Graph (nodes + edges + fingerprint)
-  (sessions)      │  segment · NER · canon.    │        │
-                  │  · claims · preferences    │        │
-                  │  · events · episodes       │        │
-                  │  · corpus signals          │        │
-                  └────────────────────────────┘        │
-                                                        ▼
-                  ┌────────────────────────────┐
-       Query ────▶│ recall/                    │──▶ Subgraph + context + 1 answerer call
-                  │  intent · seed · expand    │              │
-                  │  · rank · assemble · answer│              │
-                  └────────────────────────────┘              │
-                                                              │
-                  ┌────────────────────────────┐              │
-                  │ diagnostics/               │◀─────────────┘
-                  │  classify · coverage       │──▶ Per-run failure classification
-                  │  · fingerprint audit       │      (R15 enum)
-                  └────────────────────────────┘
-                             ▲
-                             │  calls `MemorySystem.*` verbs
-                             │
-  agent-memory-benchmark (external repo) ──────────────────────────────
-                  ┌────────────────────────────┐
-                  │ benchmarking/              │──▶ Scorecards (LME-s, LOCOMO)
-                  │  datasets · judge · runner │
-                  │  · cache · replicates      │
-                  └────────────────────────────┘
+   Dataset    ──▶ │ benchmark/                 │
+   (LME-s,        │  loader · runner · cache   │
+    LOCOMO)       │  · replicates              │
+                  └─────────────┬──────────────┘
+                                │
+                  ┌─────────────▼──────────────┐
+                  │ agent (LLM loop)           │ ◀── 1 answerer call per question
+                  │  uses engram as tool       │     (ollama:llama3.1:8b)
+                  └─────────────┬──────────────┘
+                                │ ingest(memory) / recall(query)
+                                │
+   engram (this repo)           │
+   ───────────────────────────────────────────────────────────────────
+                  ┌─────────────▼──────────────┐
+                  │ MemorySystem               │
+                  │  ingest · recall · reset   │
+                  │  · save_state · load_state │
+                  └──┬──────────────────────┬──┘
+                     │                      │
+   ┌─────────────────▼─────────┐  ┌─────────▼──────────────┐
+   │ ingestion/                │  │ recall/                │
+   │  segment · n-gram · NER   │  │  intent · seed · expand│──▶ RecallResult
+   │  · canonicalize · claim   │  │  · score · assemble    │    (structured output
+   │  · preference · embed     │  └────────────────────────┘     for the agent)
+   │  · derived rebuilds       │
+   │  · graph + vector index   │
+   └──────────┬────────────────┘
+              │ writes append-only primary;
+              │ rebuilds derived indexes
+              ▼
+        ┌─────────────────────────────────┐
+        │ Graph (5 layers × 4 granularities) +
+        │  parallel embedding vector index │
+        └─────────────────────────────────┘
+                                       ▲
+                  ┌────────────────────┴────────────────────┐
+                  │ diagnostics/                            │
+                  │  classify · coverage · fingerprint audit│ ◀── (AnswerResult, gold)
+                  └─────────────────────────────────────────┘     from the benchmark
 ```
 
 ## Key Components
 
 | Component | Purpose | Location |
 |-----------|---------|----------|
-| `ingestion/` | Convert sessions → graph; deterministic fingerprint | `engram/ingestion/` |
-| `recall/` | Subgraph retrieval + context assembly + 1 answerer call | `engram/recall/` |
-| `diagnostics/` | Failure classification (R15), fingerprint audits, coverage reports | `engram/diagnostics/` |
-| `engram.MemorySystem` | Public protocol — the only surface external callers touch | `engram/__init__.py` |
-| benchmarking | LME-s and LOCOMO orchestration, judging, scoring, caching — **external** | `agent-memory-benchmark` repo |
+| `ingestion/` | Convert each Memory into graph nodes and edges (append-only primary, rebuildable derived). Maintain ingestion fingerprint. | `engram/ingestion/` |
+| `recall/` | Convert a query into a structured `RecallResult` for the outside agent. No LLM calls. | `engram/recall/` |
+| `diagnostics/` | Failure classification (R15), fingerprint audits, coverage reports. Read-only. | `engram/diagnostics/` |
+| `engram.MemorySystem` | Public protocol — the only surface external callers touch. Five verbs: `ingest`, `recall`, `reset`, `save_state`, `load_state`. | `engram/__init__.py` |
+| benchmarking + answerer agent | Orchestration, dataset loading, judging, scoring, replicates, **and the LLM agent that uses engram as a tool** — **external** | `agent-memory-benchmark` repo |
 
 ## Data Flow
 
-1. **Ingest.** `MemorySystem.ingest_session(session, conversation_id)` appends a session to the per-conversation graph; `finalize_conversation(conversation_id)` runs end-of-conversation passes (episode clustering, corpus-signal derivation). Output: deterministic graph + `ingestion_fingerprint`.
-2. **Answer.** `MemorySystem.answer_question(question, conversation_id)` runs Recall: intent classification → seeding → bounded subgraph walk → cross-encoder rerank → context assembly → single answerer call. Output: `AnswerResult(answer, retrieved_units, timing)`.
-3. **Benchmark (external).** The `agent-memory-benchmark` repo orchestrates ingest + answer + judge across a dataset by calling `MemorySystem.*` verbs. It owns its own cache keyed by `(memory_system_id, ingestion_fingerprint, answer_fingerprint, dataset_hash, question_id)` — engram exposes the fingerprints; composing the cache key is the benchmark's job.
-4. **Diagnose.** `diagnostics.classify_failures(...)` produces a per-question enum classification (`extraction_miss | graph_gap | retrieval_miss | partial_retrieval | prompt_miss | answerer_miss`) from an `AnswerResult` plus gold annotations handed in by the benchmark, using engram-internal knowledge of the graph where needed. Bucket-level breakdowns and extraction-coverage / fingerprint-audit reports are also emitted here.
+1. **Ingest.** The agent calls `MemorySystem.ingest(memory)`. Engram segments the Memory's content into granules (Turn → Sentences → N-grams), runs NER, canonicalizes entities, extracts claims and preferences, embeds each granule, and anchors timestamps. All primary data is append-only.
+2. **Derive (lazy).** Before the next recall, engram rebuilds derived indexes from primary if they're stale: co-occurrence counts, alias sets, current-truth indexes per (holder, target), change-event nodes when current truth flips, episodic clusters. Rebuilds are idempotent.
+3. **Recall.** The agent calls `MemorySystem.recall(query, *, now, timezone, max_results)`. Engram classifies intent, seeds via vector-index nearest-neighbor on granule embeddings, expands via typed-edge BFS with intent-specific weights, scores the resulting subgraph, and returns a structured `RecallResult` (ranked passages + supporting edges + provenance).
+4. **Agent answers.** The benchmark's agent serializes `RecallResult` into its tool-call response, may issue more recall calls, and eventually produces an answer with one `llama3.1:8b` call. The judge scores the answer.
+5. **Diagnose.** `diagnostics.classify_failures(...)` consumes `(AnswerResult, gold_annotations)` from the benchmark plus engram's graph internals and produces an enum classification (`extraction_miss | graph_gap | retrieval_miss | partial_retrieval | output_miss | agent_miss`).
 
 ## Key Decisions
 
 | Decision | Rationale | Date |
 |----------|-----------|------|
-| Graph-first architecture (over flat multi-layer RRF) | Predecessor plateaued at 76% on flat layers; red buckets are graph-shaped | 2026-04-20 |
-| No LLM at ingest on default path | Cost + determinism + R5 discipline; LLM is opt-in enhancement layer | 2026-04-20 |
-| `llama3.1:8b` as permanent answerer | North-star thesis: memory quality closes the gap, not model capability | 2026-04-20 |
-| LongMemEval-s 100q as primary benchmark | Diverse bucket structure; fits in iteration budget | 2026-04-20 |
-| Greenfield repo (not in-place rewrite of `agent-memory`) | Clean slate; predecessor stays runnable as a baseline | 2026-04-20 |
+| Engram is a memory tool, not an answerer | Mirrors production: agents use memory tools. Engram never calls an LLM. | 2026-04-20 |
+| Two core verbs: `ingest(memory)` and `recall(query)` | No conversation IDs in the API. The agent decides what's a memory; one engram instance = one memory. | 2026-04-20 |
+| Five layers × four granularities in the graph | Rich indexing narrows the search space even if the agent only sees a subset of returned content. | 2026-04-20 |
+| Append-only primary, rebuildable derived | Time-travel queries, attribution, and reinforcement counting fall out for free. | 2026-04-20 |
+| Content-addressed primitives, observations as edges | Counting "how many times the user said X" works via edge enumeration; entities are deduplicated automatically. | 2026-04-20 |
+| Graph-first architecture (over flat multi-layer RRF) | Predecessor plateaued at 76% on flat layers; red buckets are graph-shaped. | 2026-04-20 |
+| No LLM at ingest or recall on default path | Cost + determinism + R5/R13 discipline; LLM is opt-in enhancement layer. | 2026-04-20 |
+| `llama3.1:8b` as the benchmark agent's answerer | North-star thesis: memory quality closes the gap, not model capability. | 2026-04-20 |
+| LongMemEval-s 100q as primary benchmark | Diverse bucket structure; fits in iteration budget. | 2026-04-20 |
+| Greenfield repo (not in-place rewrite of `agent-memory`) | Clean slate; predecessor stays runnable as a baseline. | 2026-04-20 |
+| `recall` returns no answer; the agent answers | Production-realistic; engram never owns the answer prompt. | 2026-04-20 |
+| No reranker in recall v1 | Walk scores are legible and tunable; add a reranker only when diagnostics shows ranking quality is the bottleneck. | 2026-04-20 |
 
 ## External Dependencies
 
 | Service | Purpose | Notes |
 |---------|---------|-------|
-| Ollama | Local inference for answerer | `llama3.1:8b` is the canonical answerer; no paid API in default path. The judge lives in the external benchmark repo. |
-| Sentence-Transformers | Embeddings for seeding and ranking | To be chosen during Ingestion implementation; `all-MiniLM-L6-v2` is the predecessor's default |
-| spaCy | Sentence splitting, NER, dependency parses | Enables no-LLM-at-ingest (R5) extraction |
+| Ollama | The benchmark agent's answerer. **Not invoked from engram.** | `llama3.1:8b` is the canonical answerer; lives outside engram. |
+| Sentence-Transformers | Embeddings for granule semantic indexing and seeding | `all-MiniLM-L6-v2` for granule embeddings; `all-mpnet-base-v2` for preference centroids. |
+| spaCy | Sentence splitting, n-gram extraction, NER, dependency parses | Enables no-LLM-at-ingest (R5) extraction |
+| rapidfuzz | String similarity for entity canonicalization | Fast, deterministic. |
+| networkx | In-memory `MultiDiGraph` storage | One graph per engram instance. |
+| msgpack | Versioned persistence | Schema version on every save (R12). |
+| numpy | Embedding vector index storage | Parallel to the graph; keyed by node ID. |
 
 Dataset access (LongMemEval-s, LOCOMO) is owned by the external `agent-memory-benchmark` repo and is not a direct dependency of engram.
 
 ## Status & Next Steps
 
-**Current state.** Verification skeleton steps 1–4 complete (manifesto, module scaffolds, `MemorySystem` protocol, fingerprint-discipline CI). Step 5 (external benchmark integration smoke) happens in the `agent-memory-benchmark` repo, not here — engram's job is to stay installable and protocol-stable.
+**Current state.** Verification skeleton complete (manifesto, module scaffolds, `MemorySystem` protocol, fingerprint-discipline CI). Tier-1 ingestion implementation has landed (`engram/ingestion/` with schema, graph, persist, six extractors, pipeline, factory, and `EngramGraphMemorySystem`). The Tier-1 implementation predates this architecture pivot — it uses Session/Turn as inputs and has an `answer_question` stub that raises `NotImplementedError`. The patches described below bring it in line with the new design.
 
-**Where design attention goes next — the memory system itself.** The three modules have boundary docstrings but no interiors. Design planning and implementation follow this order:
+**Where design attention goes next.**
 
-1. **Ingestion** — graph storage choice (must satisfy R2, R12), concrete node/edge schema from the manifesto §3 sketch, deterministic extraction pipeline (segmentation → NER → canonicalization → claim → preference → temporal → event → episode → corpus signals), preference-detection discrimination protocol (R6, fails-closed).
-2. **Recall** — intent taxonomy prototypes and seed queries (R6, no English-specific regex), per-intent seeding and expansion edge-weight schemas, ranker, R11-compliant context assembly, R13 single-file answerer prompt template.
-3. **Diagnostics** — R15 classifier over `(AnswerResult, gold_annotations)`, oracle subgraph computation, `needle_recall@k` / `session_density` / `completeness` metrics, extraction-coverage reports, K7 fingerprint audits. Input shape is defined by the external benchmark's run-result contract.
+1. **Ingestion patch** — surface change from `ingest_session(session, conversation_id)` to `ingest(memory)`; introduce n-gram granularity; add granule embedding storage + vector index; remove primary-data mutations (Entity alias growth, Claim relabeling); promote co-occurrence to derived; add TimeAnchor nodes and `temporal_at` edges; add the 5-layer label scheme.
+2. **Recall design + implementation** — `docs/design/recall.md` is the next design doc; implementation follows once locked.
+3. **Diagnostics design** — R15 classifier over `(AnswerResult, gold_annotations)`, oracle subgraph computation, `needle_recall@k` / `granule_density` / `completeness` metrics, extraction-coverage reports, K7 fingerprint audits.
 
 Every design-phase PR cites the rule(s) it implements or the M1 hypothesis (target bucket, expected pp gain, mechanism, validation threshold, falsification condition) it tests.
 
 ## Local Development
 
-Not yet wired — see the top-level `README.md` for setup once implementation begins.
+Not yet wired — see the top-level `README.md` for setup once recall implementation lands.
