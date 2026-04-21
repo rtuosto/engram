@@ -20,7 +20,6 @@ import pytest
 
 from engram import AnswerResult, MemorySystem, RetrievedNode, Session, Turn
 
-
 _EXPECTED_VERBS = frozenset({
     "ingest_session",
     "finalize_conversation",
