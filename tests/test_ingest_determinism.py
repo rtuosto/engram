@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from engram.config import MemoryConfig
-from engram.ingestion.persist import dump_conversation
+from engram.ingestion.persist import dump_state
 from engram.ingestion.pipeline import IngestionPipeline
 from engram.ingestion.preferences import compute_centroids
 from engram.ingestion.schema import PREFERENCE_POLARITIES
@@ -98,6 +98,7 @@ def _make_pipeline(config: MemoryConfig, docs_by_text: dict):
         nlp_process=make_nlp_process(docs_by_text),
         preference_centroids=centroids,
         preference_embed=embed,
+        granule_embed=deterministic_embed(dim=16),
         enabled_polarities=frozenset(PREFERENCE_POLARITIES),
     )
 
@@ -108,7 +109,7 @@ def _run_ingest(config: MemoryConfig) -> bytes:
     state = pipeline.create_state()
     for memory in memories:
         pipeline.ingest(state, memory)
-    return dump_conversation(state.store)
+    return dump_state(state.store)
 
 
 def test_ingest_same_process_byte_identical() -> None:
@@ -134,7 +135,7 @@ def test_ingest_independent_states_byte_identical() -> None:
     for m in memories:
         pipeline_2.ingest(state_2, m)
 
-    assert dump_conversation(state_1.store) == dump_conversation(state_2.store)
+    assert dump_state(state_1.store) == dump_state(state_2.store)
 
 
 def test_ingest_differs_when_config_differs() -> None:

@@ -72,6 +72,7 @@ def _make_system(config: MemoryConfig | None = None) -> EngramGraphMemorySystem:
         nlp_process=make_nlp_process(docs),
         preference_centroids=centroids,
         preference_embed=embed,
+        granule_embed=deterministic_embed(dim=16),
         enabled_polarities=frozenset(PREFERENCE_POLARITIES),
     )
     return EngramGraphMemorySystem(config=config, pipeline=pipeline)

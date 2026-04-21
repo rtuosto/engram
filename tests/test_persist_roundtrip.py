@@ -1,6 +1,6 @@
 """Persistence roundtrip + schema-version error tests (R12).
 
-A ``dump_conversation`` followed by ``load_conversation`` must reconstruct
+A ``dump_state`` followed by ``load_state`` must reconstruct
 the GraphStore faithfully — same nodes, same labels, same payloads, same
 edges, same edge attrs, same frozen state. Schema-version drift must raise
 :class:`SchemaVersionMismatch` rather than silently migrating.
@@ -17,8 +17,8 @@ from engram.ingestion.persist import (
     SCHEMA_VERSION,
     PersistFormatError,
     SchemaVersionMismatch,
-    dump_conversation,
-    load_conversation,
+    dump_state,
+    load_state,
 )
 from engram.ingestion.schema import (
     EDGE_ABOUT,
@@ -151,8 +151,8 @@ def _build_store() -> GraphStore:
 def test_roundtrip_preserves_nodes_and_edges() -> None:
     original = _build_store()
     original.freeze()
-    data = dump_conversation(original)
-    restored = load_conversation(data)
+    data = dump_state(original)
+    restored = load_state(data)
 
     assert restored.conversation_id == original.conversation_id
     assert restored.frozen is True
@@ -177,47 +177,47 @@ def test_roundtrip_preserves_nodes_and_edges() -> None:
 def test_roundtrip_is_byte_stable() -> None:
     store = _build_store()
     store.freeze()
-    assert dump_conversation(store) == dump_conversation(store)
+    assert dump_state(store) == dump_state(store)
 
 
 def test_schema_version_mismatch_rejects_older() -> None:
     store = _build_store()
-    data = dump_conversation(store)
+    data = dump_state(store)
     envelope = msgpack.unpackb(data, raw=False, strict_map_key=False)
     envelope["schema_version"] = SCHEMA_VERSION - 1
     tampered = msgpack.packb(envelope, use_bin_type=True)
     with pytest.raises(SchemaVersionMismatch):
-        load_conversation(tampered)
+        load_state(tampered)
 
 
 def test_schema_version_mismatch_rejects_newer() -> None:
     store = _build_store()
-    data = dump_conversation(store)
+    data = dump_state(store)
     envelope = msgpack.unpackb(data, raw=False, strict_map_key=False)
     envelope["schema_version"] = SCHEMA_VERSION + 1
     tampered = msgpack.packb(envelope, use_bin_type=True)
     with pytest.raises(SchemaVersionMismatch):
-        load_conversation(tampered)
+        load_state(tampered)
 
 
 def test_foreign_memory_system_id_rejected() -> None:
     store = _build_store()
-    data = dump_conversation(store)
+    data = dump_state(store)
     envelope = msgpack.unpackb(data, raw=False, strict_map_key=False)
     envelope["memory_system_id"] = "not_engram"
     tampered = msgpack.packb(envelope, use_bin_type=True)
     with pytest.raises(PersistFormatError):
-        load_conversation(tampered)
+        load_state(tampered)
 
 
 def test_missing_schema_version_rejected() -> None:
     store = _build_store()
-    data = dump_conversation(store)
+    data = dump_state(store)
     envelope = msgpack.unpackb(data, raw=False, strict_map_key=False)
     del envelope["schema_version"]
     tampered = msgpack.packb(envelope, use_bin_type=True)
     with pytest.raises(PersistFormatError):
-        load_conversation(tampered)
+        load_state(tampered)
 
 
 def test_memory_system_id_constant_matches() -> None:

@@ -12,6 +12,13 @@ dicts in sorted order yields byte-stable msgpack output.
 file save layout (primary + embeddings + derived) is the
 :class:`engram.engram_memory_system`-level concern; this module owns the
 single-file primary contract.
+
+**Version history.**
+- v1 (PR-A / PR-B): initial post-pivot primary file.
+- v2 (PR-C): bumped alongside the parallel vector-index sidecar
+  (``embeddings.npy`` + ``node_ids.json``). The primary msgpack payload is
+  shape-compatible with v1, but we bump the schema so a v1 save without
+  the embedding sidecar can't silently load as a v2-capable instance.
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ from engram.ingestion.schema import (
     UtteranceSegmentPayload,
 )
 
-SCHEMA_VERSION: Final[int] = 1
+SCHEMA_VERSION: Final[int] = 2
 MEMORY_SYSTEM_ID: Final[str] = "engram_graph"
 
 # Dataclass kind registry — each payload declares a stable string so the
@@ -132,7 +139,7 @@ def _encode_node_attrs(attrs: dict[str, Any]) -> dict[str, Any]:
     return encoded
 
 
-def dump_conversation(store: GraphStore) -> bytes:
+def dump_state(store: GraphStore) -> bytes:
     """Serialize ``store`` to versioned msgpack bytes — R2-deterministic."""
     nodes_payload: list[dict[str, Any]] = []
     for node_id, attrs in store.iter_nodes():
@@ -222,7 +229,7 @@ def _decode_node_attrs(encoded: dict[str, Any]) -> dict[str, Any]:
     return attrs
 
 
-def load_conversation(data: bytes) -> GraphStore:
+def load_state(data: bytes) -> GraphStore:
     """Reconstruct a ``GraphStore`` from its msgpack bytes.
 
     Raises :class:`SchemaVersionMismatch` on version drift and
@@ -264,9 +271,9 @@ def load_conversation(data: bytes) -> GraphStore:
         labels = attrs.pop("labels", frozenset())
         layers = attrs.pop("layers", frozenset())
         payloads = {k: v for k, v in attrs.items() if k in labels}
-        # Any attrs keyed by a label name are payloads. Older files without
-        # a ``layers`` key default to an empty frozenset — forward-compatible
-        # with pre-PR-B dumps until we bump SCHEMA_VERSION in PR-C.
+        # Any attrs keyed by a label name are payloads. ``layers`` defaults
+        # to an empty frozenset for nodes without a classification label
+        # (granules — see docs/design/ingestion.md §3).
         store.add_node(node_id, labels=labels, payloads=payloads, layers=layers)
 
     for entry in envelope.get("edges", []):
@@ -298,7 +305,7 @@ __all__ = [
     "PersistFormatError",
     "SCHEMA_VERSION",
     "SchemaVersionMismatch",
-    "dump_conversation",
-    "load_conversation",
+    "dump_state",
+    "load_state",
     "payload_to_dict",
 ]

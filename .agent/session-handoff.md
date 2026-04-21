@@ -5,6 +5,75 @@
 
 ---
 
+## Session: 2026-04-20 — PR-C (granule embeddings + parallel vector index)
+
+### What Was Done
+
+Landed PR-C on `feat/pr-c-embeddings`. Patch 4 from `docs/design/ingestion.md §12`:
+
+**Patch 4 — granule embeddings + parallel vector index.**
+- New `engram/ingestion/vector_index.py` with `VectorIndex` dataclass:
+  - `add(node_id, granularity, vector)` — appends a row; rejects duplicate IDs; L2-normalizes defensively (zero vectors stored as-is, fail-closed on knn).
+  - `knn(query, k, *, granularity_filter=None)` — brute-force cosine top-k; normalizes the query; ties broken by `node_id` (R2). `granularity_filter` accepts a single string or frozenset over `{turn, sentence, ngram}`.
+  - `save(embeddings_path, node_ids_path)` / `VectorIndex.load(...)` — two-file sidecar: `embeddings.npy` raw numpy matrix + `node_ids.json` schema-versioned envelope `{schema_version, dim, node_ids, granularities}`.
+  - `VECTOR_INDEX_SCHEMA_VERSION = 1` with its own `VectorIndexFormatError`.
+- `InstanceState` gains `vector_index: VectorIndex | None`, lazy-initialized on the first ingest (dim discovered from the first embed batch, frozen thereafter).
+- `IngestionPipeline.__init__` now takes `granule_embed: Callable[[list[str]], np.ndarray]` — the MiniLM batch encoder.
+- Pipeline stage [8] (`_emit_granule_embeddings`): one batched `granule_embed(texts)` call per ingest; rows appended to the vector index in pipeline emission order (Turn → Sentences in segment_index order → N-grams in `(char_span, kind, normalized_text)` order). N-gram identity collisions within a single ingest are deduped before the index call.
+- `factory.build_default_pipeline` wires a second `_load_embed_fn(config.embedding_model)` for granules (previously only the preference-embed model was loaded).
+
+**Persistence rename + schema bump.**
+- `persist.dump_conversation` / `load_conversation` → `dump_state` / `load_state`.
+- `SCHEMA_VERSION: 1 → 2`. Primary msgpack payload shape is unchanged from v1; the bump prevents silent loading of v1 saves that don't have the vector-index sidecar.
+- `EngramGraphMemorySystem.save_state` writes `embeddings.npy` + `node_ids.json` alongside `primary.msgpack`; manifest gains `has_embeddings: bool`. `load_state` restores the vector index when the manifest declares it.
+- `memory_version` bumped `0.2.0` → `0.3.0`.
+- New filename constants: `EMBEDDINGS_FILENAME`, `NODE_IDS_FILENAME`.
+
+**Tests.** New `tests/test_vector_index.py` — 23 tests across:
+- Unit: add/normalize/dup-reject, knn top-k + tiebreak, granularity filter (single + frozenset), zero-vector + zero-query fail-closed paths.
+- Persistence: roundtrip preserves vectors + granularities; save is byte-stable; neighbor lookups stable across save/load; schema-version mismatch rejected; length-mismatch sidecars rejected.
+- Pipeline integration: every granule (Turn + Sentence + N-gram) is indexed after ingest; no non-granules leak in.
+- `save_state` round-trip: sidecars present, manifest declares them, restored state carries an equivalent `VectorIndex`.
+- R2 sidecar audit: two independent pipeline constructions produce byte-identical `embeddings.npy` + `node_ids.json`.
+
+Touched existing tests (`test_persist_roundtrip`, `test_ingest_determinism`, `test_memory_system_integration`, `test_layers`) to use the renamed persist functions and pass `granule_embed` to `IngestionPipeline`.
+
+Test suite: 146 passing (was 123 on PR-B); ruff clean; mypy 16 pre-existing errors (unchanged).
+
+### Current State
+
+- Branch: `feat/pr-c-embeddings` (open; not yet PR'd against main)
+- `main` at `fb08c76` — PR-B merged
+- Tests: 146 passing, ruff clean, mypy 16 pre-existing errors
+- Build: `pip install -e .` unchanged
+- `SCHEMA_VERSION = 2`. Old v1 files will be rejected on load (no migration shim; reingest).
+
+### What's Next
+
+**Immediate:** open PR-C → main → merge.
+
+Then the remaining roadmap:
+
+1. ~~**PR-B** — n-gram granularity + layer labels.~~
+2. ~~**PR-C** — granule embeddings + parallel vector index + `dump_state`/`load_state` rename + `SCHEMA_VERSION` bump to 2.~~ (this session)
+3. **PR-D** — TimeAnchor + derived-rebuild orchestrator.
+4. **PR-E** — recall implementation (greenfield `engram/recall/`).
+
+### Open Questions
+
+- `granule_embed` is a separate callable from `preference_embed`, both loaded in `factory.py`. They currently use different models (MiniLM vs mpnet), so the duplication is correct. If a future config unifies them, collapse to one encoder.
+- Vector-index brute-force cosine is fine at the design's scale triggers; swap to faiss only after one of the §2 thresholds fires.
+- Real MiniLM determinism depends on torch determinism flags already set by `factory._seed_rngs`. The R2 audit tests use the fake `deterministic_embed`; a real-model R2 sidecar byte-check lives in the smoke script (to be refreshed in a follow-up).
+
+### Gotchas
+
+- Zero-norm input vectors are stored as zeros; they score 0 against every query and will never appear in knn top-k unless every candidate scores 0 (fail-closed). If this ever bites someone, add a strict mode that raises.
+- `VectorIndex.add` is O(N) because `np.vstack` reallocates. At the design's granule counts per engram instance this is dominated by the embed call; revisit if ingest p50 exceeds the §2 threshold.
+- Sidecar filenames are `embeddings.npy` + `node_ids.json`. Don't rename without bumping both `SCHEMA_VERSION` and `VECTOR_INDEX_SCHEMA_VERSION`.
+- `_emit_ngrams` now dedupes repeat `ngram_id` within a single ingest before adding to the embedding batch. The underlying `add_node` / `add_edge` already tolerated duplicates (label-union + edge-overwrite); the new dedup is for `VectorIndex.add`, which rejects duplicate node_ids.
+
+---
+
 ## Session: 2026-04-20 — PR-B (n-gram granularity + layer labels)
 
 ### What Was Done

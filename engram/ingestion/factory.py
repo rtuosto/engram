@@ -81,6 +81,7 @@ def build_default_pipeline(config: MemoryConfig) -> IngestionPipeline:
 
     nlp_process = _load_spacy(config.spacy_model)
     preference_embed = _load_embed_fn(config.preference_embedding_model)
+    granule_embed = _load_embed_fn(config.embedding_model)
 
     centroids = compute_centroids(preference_embed)
     margins = median_discrimination_margin(centroids, preference_embed)
@@ -93,6 +94,7 @@ def build_default_pipeline(config: MemoryConfig) -> IngestionPipeline:
         nlp_process=nlp_process,
         preference_centroids=centroids,
         preference_embed=preference_embed,
+        granule_embed=granule_embed,
         enabled_polarities=enabled,
     )
 
