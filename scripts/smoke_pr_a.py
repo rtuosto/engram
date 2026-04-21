@@ -19,7 +19,7 @@ from pathlib import Path
 
 from engram import EngramGraphMemorySystem, Memory
 from engram.config import MemoryConfig
-from engram.ingestion.persist import dump_conversation
+from engram.ingestion.persist import dump_state
 from engram.ingestion.schema import (
     EDGE_ASSERTS,
     EDGE_HOLDS_PREFERENCE,
@@ -164,8 +164,8 @@ def run() -> None:
     asyncio.run(_ingest_all(system_b, CORPUS))
     state_b = system_b.get_state()
     assert state_b is not None
-    bytes_a = dump_conversation(state_a.store)
-    bytes_b = dump_conversation(state_b.store)
+    bytes_a = dump_state(state_a.store)
+    bytes_b = dump_state(state_b.store)
     _check(
         bytes_a == bytes_b,
         "two independent ingests produce byte-identical msgpack",
@@ -201,7 +201,7 @@ def run() -> None:
             f"{state_r.store.num_edges()} vs {state_a.store.num_edges()}",
         )
         # Byte-compare a re-dump of the restored store against the original.
-        bytes_restored = dump_conversation(state_r.store)
+        bytes_restored = dump_state(state_r.store)
         _check(
             bytes_restored == bytes_a,
             "restored store re-serializes byte-identical to original",

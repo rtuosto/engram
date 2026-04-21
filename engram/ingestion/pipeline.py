@@ -9,11 +9,13 @@ Pipeline order (``docs/design/ingestion.md §6``):
 5. Entity canonicalization
 6. Claim extraction
 7. Preference detection (fails closed per polarity gate)
+8. Granule embedding (Turn + Sentence + N-gram → parallel vector index)
 
-Per-instance state (:class:`InstanceState`) owns the GraphStore and the
-working caches (EntityRegistry, monotonic ``memory_index``, speaker Entity
-index). The pipeline itself is stateless — its construction carries the
-model dependencies and per-polarity enablement gate.
+Per-instance state (:class:`InstanceState`) owns the GraphStore, the
+parallel :class:`VectorIndex`, and the working caches (EntityRegistry,
+monotonic ``memory_index``, speaker Entity index). The pipeline itself is
+stateless — its construction carries the model dependencies and per-
+polarity enablement gate.
 
 **R5.** No LLM calls on this path. Everything here is spaCy + deterministic
 embeddings + rapidfuzz + counts.
@@ -85,6 +87,12 @@ from engram.ingestion.schema import (
     segment_identity,
     turn_identity,
 )
+from engram.ingestion.vector_index import (
+    GRANULARITY_NGRAM,
+    GRANULARITY_SENTENCE,
+    GRANULARITY_TURN,
+    VectorIndex,
+)
 from engram.models import Memory
 
 SPEAKER_ENTITY_TYPE = "SPEAKER"
@@ -99,12 +107,18 @@ class InstanceState:
     ``memory_index`` is a monotonic counter so Memory nodes from repeat
     ``ingest`` calls never collide (R16: Memories are events, never
     deduplicated).
+
+    ``vector_index`` is the parallel granule-embedding store (``P10``).
+    Lazy-initialized on the first ingest so ``create_state`` doesn't need
+    to know the embedding dim up front (the pipeline discovers it from
+    the first batch of granule embeddings).
     """
 
     store: GraphStore
     entity_registry: EntityRegistry = field(default_factory=EntityRegistry)
     speaker_to_entity_id: dict[str, str] = field(default_factory=dict)
     memory_index: int = 0
+    vector_index: VectorIndex | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,12 +162,14 @@ class IngestionPipeline:
         nlp_process: Callable[[list[str]], list[object]],
         preference_centroids: dict[str, np.ndarray],
         preference_embed: Callable[[list[str]], np.ndarray],
+        granule_embed: Callable[[list[str]], np.ndarray],
         enabled_polarities: frozenset[str],
     ) -> None:
         self._config = config
         self._nlp_process = nlp_process
         self._centroids = preference_centroids
         self._preference_embed = preference_embed
+        self._granule_embed = granule_embed
         self._enabled_polarities = enabled_polarities
 
     # ------------------------------------------------------------------
@@ -173,21 +189,36 @@ class IngestionPipeline:
 
             raise GraphFrozenError("cannot ingest into frozen engram instance")
 
+        # Granule accumulator — populated by emit-granule stages in R2-stable
+        # insertion order (Turn → Sentence(s) → N-gram(s)). Flushed to the
+        # vector index in a single batched embed call at stage [8], after the
+        # graph writes are done.
+        granule_batch: list[tuple[str, str, str]] = []
+
         # [1] Memory + Turn granule.
         memory_id, memory_payload = self._emit_memory(state, memory)
-        turn_id, _ = self._emit_turn_granule(state, memory_id, memory)
+        turn_id, _ = self._emit_turn_granule(
+            state, memory_id, memory, granule_batch=granule_batch
+        )
 
         # [2] spaCy process the Memory's content.
         docs = self._nlp_process([memory.content])
         if not docs:
+            # Turn granule exists but has no sentences / n-grams — still embed
+            # the whole-Memory representation so recall can find it.
+            self._emit_granule_embeddings(state, granule_batch)
             return
         doc = docs[0]
 
         # [3] Segmentation.
-        segments = self._emit_segments(state, turn_id, doc, memory_id=memory_id)
+        segments = self._emit_segments(
+            state, turn_id, doc, memory_id=memory_id, granule_batch=granule_batch
+        )
 
         # [4] N-gram extraction (noun_chunk + SVO).
-        self._emit_ngrams(state, doc, segments, memory_id=memory_id)
+        self._emit_ngrams(
+            state, doc, segments, memory_id=memory_id, granule_batch=granule_batch
+        )
 
         # [5] NER.
         mentions = extract_mentions(doc, turn_id)
@@ -212,10 +243,14 @@ class IngestionPipeline:
             segments=tuple(segments),
         )
 
-        # [7] + [8] — claim extraction + preference detection per sentence.
+        # [7] — claim extraction + preference detection per sentence.
         self._extract_claims_and_preferences(
             state, work, asserted_at=memory.timestamp
         )
+
+        # [8] — granule embedding. One batched call per ingest; rows appended
+        # to state.vector_index in insertion order.
+        self._emit_granule_embeddings(state, granule_batch)
 
     # ------------------------------------------------------------------
     # Internals
@@ -243,7 +278,12 @@ class IngestionPipeline:
         return mid, payload
 
     def _emit_turn_granule(
-        self, state: InstanceState, memory_id: str, memory: Memory
+        self,
+        state: InstanceState,
+        memory_id: str,
+        memory: Memory,
+        *,
+        granule_batch: list[tuple[str, str, str]],
     ) -> tuple[str, TurnPayload]:
         tid = node_id(turn_identity(memory_id))
         payload = TurnPayload(
@@ -268,10 +308,17 @@ class IngestionPipeline:
                 asserted_at=memory.timestamp,
             ),
         )
+        granule_batch.append((tid, GRANULARITY_TURN, memory.content))
         return tid, payload
 
     def _emit_segments(
-        self, state: InstanceState, turn_id: str, doc: object, *, memory_id: str
+        self,
+        state: InstanceState,
+        turn_id: str,
+        doc: object,
+        *,
+        memory_id: str,
+        granule_batch: list[tuple[str, str, str]],
     ) -> list[_SegmentInfo]:
         """Emit UtteranceSegment nodes; return per-sentence context for
         downstream stages (n-gram extraction, claim / preference).
@@ -317,6 +364,7 @@ class IngestionPipeline:
                     source_turn_id=turn_id,
                 ),
             )
+            granule_batch.append((seg_id, GRANULARITY_SENTENCE, payload.text))
         return segments
 
     def _emit_ngrams(
@@ -326,6 +374,7 @@ class IngestionPipeline:
         segments: list[_SegmentInfo],
         *,
         memory_id: str,
+        granule_batch: list[tuple[str, str, str]],
     ) -> None:
         """Emit N-gram nodes (noun chunks + SVO triples) with ``part_of``
         edges to their containing Sentence granule.
@@ -355,7 +404,15 @@ class IngestionPipeline:
             noun_chunk_ngrams + svo_ngrams,
             key=lambda pair: (pair[1].char_span, pair[1].ngram_kind, pair[1].normalized_text),
         )
+        # N-gram identity collapses repeated visits to the same
+        # (segment, kind, normalized_text); dedup on node_id before
+        # appending to the embedding batch so the vector index rejects
+        # duplicates that never make it into the graph.
+        seen_ngram_ids: set[str] = set()
         for ngram_id, payload in all_ngrams:
+            if ngram_id in seen_ngram_ids:
+                continue
+            seen_ngram_ids.add(ngram_id)
             state.store.add_node(
                 ngram_id,
                 labels=frozenset({LABEL_NGRAM}),
@@ -371,6 +428,48 @@ class IngestionPipeline:
                     source_turn_id=payload.segment_id,
                 ),
             )
+            granule_batch.append((ngram_id, GRANULARITY_NGRAM, payload.surface_form))
+
+    def _emit_granule_embeddings(
+        self,
+        state: InstanceState,
+        granule_batch: list[tuple[str, str, str]],
+    ) -> None:
+        """Stage [8]: batched MiniLM embedding for every granule emitted on
+        this ingest call.
+
+        ``granule_batch`` is ordered by pipeline emission: Turn first, then
+        Sentences in segment order, then N-grams in ``(char_span, kind,
+        text)`` order (see :meth:`_emit_ngrams`). That's the order the
+        vector index persists; it must be R2-stable across repeat ingests.
+
+        The index's dim is discovered from the first embed call and frozen
+        for the life of the state. A subsequent ingest whose embed function
+        returns a different dim is a configuration error.
+        """
+        if not granule_batch:
+            return
+
+        texts = [text for _nid, _gran, text in granule_batch]
+        vectors = self._granule_embed(texts)
+        arr = np.asarray(vectors, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] != len(granule_batch):
+            raise RuntimeError(
+                f"granule_embed returned shape {arr.shape}; "
+                f"expected ({len(granule_batch)}, dim)"
+            )
+        dim = int(arr.shape[1])
+
+        if state.vector_index is None:
+            state.vector_index = VectorIndex(dim=dim)
+        elif state.vector_index.dim != dim:
+            raise RuntimeError(
+                f"granule_embed produced dim {dim}; state.vector_index "
+                f"was initialized with dim {state.vector_index.dim}"
+            )
+
+        for (node_id_, granularity, _text), row in zip(granule_batch, arr, strict=True):
+            state.vector_index.add(node_id_, granularity, row)
 
     def _canonicalize_and_link_mention(
         self,

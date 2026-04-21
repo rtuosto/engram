@@ -14,13 +14,15 @@ separately, or call :meth:`reset`).
 ```
 <save_path>/
     manifest.json     # memory_system_id, memory_version, schema_version,
-                      #   ingestion_fingerprint
+                      #   ingestion_fingerprint, has_primary, has_embeddings
     primary.msgpack   # the GraphStore's nodes + edges
+    embeddings.npy    # parallel granule vector index (PR-C)
+    node_ids.json     # row-index → node_id mapping for embeddings.npy
 ```
 
 ``load_state`` verifies ``schema_version`` matches
 :data:`persist.SCHEMA_VERSION`, ``memory_system_id`` matches this instance's
-id, and the primary file decodes cleanly. No implicit migration.
+id, and every declared sidecar decodes cleanly. No implicit migration.
 """
 
 from __future__ import annotations
@@ -35,14 +37,17 @@ from engram.ingestion.persist import (
     SCHEMA_VERSION,
     PersistFormatError,
     SchemaVersionMismatch,
-    dump_conversation,
-    load_conversation,
+    dump_state,
+    load_state,
 )
 from engram.ingestion.pipeline import IngestionPipeline, InstanceState
+from engram.ingestion.vector_index import VectorIndex
 from engram.models import Memory, RecallResult
 
 MANIFEST_FILENAME: Final[str] = "manifest.json"
 PRIMARY_FILENAME: Final[str] = "primary.msgpack"
+EMBEDDINGS_FILENAME: Final[str] = "embeddings.npy"
+NODE_IDS_FILENAME: Final[str] = "node_ids.json"
 
 
 class EngramGraphMemorySystem:
@@ -54,7 +59,7 @@ class EngramGraphMemorySystem:
     """
 
     memory_system_id: str = MEMORY_SYSTEM_ID
-    memory_version: str = "0.2.0"
+    memory_version: str = "0.3.0"
 
     def __init__(
         self,
@@ -97,15 +102,29 @@ class EngramGraphMemorySystem:
         path.mkdir(parents=True, exist_ok=True)
         ingestion_fingerprint = self._config.ingestion_fingerprint()
 
+        has_primary = self._state is not None
+        has_embeddings = (
+            self._state is not None
+            and self._state.vector_index is not None
+            and len(self._state.vector_index) > 0
+        )
+
         if self._state is not None:
-            (path / PRIMARY_FILENAME).write_bytes(dump_conversation(self._state.store))
+            (path / PRIMARY_FILENAME).write_bytes(dump_state(self._state.store))
+        if has_embeddings:
+            assert self._state is not None and self._state.vector_index is not None
+            self._state.vector_index.save(
+                path / EMBEDDINGS_FILENAME,
+                path / NODE_IDS_FILENAME,
+            )
 
         manifest = {
             "memory_system_id": self.memory_system_id,
             "memory_version": self.memory_version,
             "schema_version": SCHEMA_VERSION,
             "ingestion_fingerprint": ingestion_fingerprint,
-            "has_primary": self._state is not None,
+            "has_primary": has_primary,
+            "has_embeddings": has_embeddings,
         }
         (path / MANIFEST_FILENAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -140,9 +159,20 @@ class EngramGraphMemorySystem:
             )
 
         pipeline = self._get_pipeline()
-        store = load_conversation(primary_path.read_bytes())
+        store = load_state(primary_path.read_bytes())
         state = pipeline.create_state()
         state.store = store
+
+        if manifest.get("has_embeddings", False):
+            embeddings_path = path / EMBEDDINGS_FILENAME
+            node_ids_path = path / NODE_IDS_FILENAME
+            if not embeddings_path.exists() or not node_ids_path.exists():
+                raise PersistFormatError(
+                    "manifest declared has_embeddings=True but vector-index "
+                    f"sidecar files are missing under {path}"
+                )
+            state.vector_index = VectorIndex.load(embeddings_path, node_ids_path)
+
         # memory_index is not restored from persisted primary — the graph
         # already reflects every ingested Memory. A follow-up ingest
         # continues from `state.memory_index + max-observed-index`; for
@@ -169,7 +199,9 @@ class EngramGraphMemorySystem:
 
 
 __all__ = [
+    "EMBEDDINGS_FILENAME",
     "EngramGraphMemorySystem",
     "MANIFEST_FILENAME",
+    "NODE_IDS_FILENAME",
     "PRIMARY_FILENAME",
 ]
