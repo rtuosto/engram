@@ -25,7 +25,7 @@ are ever emitted. Computed by callers via
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -88,6 +88,60 @@ def classify(
     return PreferenceVerdict(polarity=top_polarity, confidence=confidence)
 
 
+def classify_batch(
+    claim_texts: Sequence[str],
+    centroids: Mapping[str, np.ndarray],
+    embed_fn: Callable[[list[str]], np.ndarray],
+    *,
+    margin_threshold: float,
+    enabled_polarities: frozenset[str],
+) -> tuple[PreferenceVerdict | None, ...]:
+    """Batched form of :func:`classify` — one ``embed_fn`` call for N texts.
+
+    Per-row scoring (L2 normalization, cosine dots, top-vs-second margin,
+    enabled-polarity gate) is bit-identical to :func:`classify` so the two
+    paths produce the same verdicts for the same inputs. The only
+    difference is that ``embed_fn`` is invoked once on the full batch
+    rather than N times on singletons — sentence-transformers' batched
+    encode returns the same pooled vector per row as the per-text call on
+    CPU inference.
+
+    Shape: returns a tuple of ``PreferenceVerdict | None`` aligned
+    positionally with ``claim_texts``.
+    """
+    if not claim_texts:
+        return ()
+    if not enabled_polarities:
+        return (None,) * len(claim_texts)
+
+    texts = list(claim_texts)
+    vectors = embed_fn(texts)
+    if vectors.shape[0] != len(texts):
+        raise ValueError(
+            f"embed_fn returned {vectors.shape[0]} rows for {len(texts)} inputs"
+        )
+
+    verdicts: list[PreferenceVerdict | None] = []
+    for row in vectors:
+        norm = float(np.linalg.norm(row))
+        unit = row / norm if norm > 0.0 else row
+        scores: dict[str, float] = {
+            p: float(unit @ centroids[p]) for p in PREFERENCE_POLARITIES
+        }
+        ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        top_polarity, top_score = ordered[0]
+        second_score = ordered[1][1] if len(ordered) > 1 else float("-inf")
+        if top_polarity not in enabled_polarities:
+            verdicts.append(None)
+            continue
+        if (top_score - second_score) < margin_threshold:
+            verdicts.append(None)
+            continue
+        confidence = max(0.0, min(1.0, top_score))
+        verdicts.append(PreferenceVerdict(polarity=top_polarity, confidence=confidence))
+    return tuple(verdicts)
+
+
 def build_preference_payload(
     verdict: PreferenceVerdict,
     claim_payload: ClaimPayload,
@@ -122,4 +176,5 @@ __all__ = [
     "PreferenceVerdict",
     "build_preference_payload",
     "classify",
+    "classify_batch",
 ]
