@@ -93,6 +93,8 @@ Measurement against **LongMemEval-s** (primary) and **LOCOMO** (validation) live
 | Greenfield repo (not in-place rewrite of `agent-memory`) | Clean slate; predecessor stays runnable as a baseline. | 2026-04-20 |
 | `recall` returns no answer; the agent answers | Production-realistic; engram never owns the answer prompt. | 2026-04-20 |
 | No reranker in recall v1 | Walk scores are legible and tunable; add a reranker only when diagnostics shows ranking quality is the bottleneck. | 2026-04-20 |
+| Preference encoder is batched per-Memory (`classify_batch`) | mpnet is the dominant per-ingest cost; one forward pass per Memory beats one per sentence. Per-row scoring stays identical to `classify()` so the verdict is byte-stable. | 2026-04-21 |
+| Ingestion perf regressions are gated by structural fingerprint, not msgpack bytes | Batched transformer inference drifts at the 7th–8th float decimal. Same graph topology + same node IDs + edge weights within 1e-5 is the correct R3/R4 proxy. | 2026-04-21 |
 
 ## External Dependencies
 
@@ -127,4 +129,17 @@ Every design-phase PR cites the rule(s) it implements or the M1 hypothesis (targ
 
 ## Local Development
 
-Not yet wired — see the top-level `README.md` for setup once recall implementation lands.
+See the top-level `README.md` for setup.
+
+**Profiling ingestion.** `scripts/profile_ingestion.py` wraps the three
+injected model callables (spaCy, mpnet preference, MiniLM granule) with
+per-stage wall-clock timers and writes a JSON artifact to `profiling/`.
+Every ingestion-perf PR pins its baseline there; `--cprofile` dumps a
+cumulative-time sample next to the JSON for drill-downs.
+
+**R3/R4 regression guard.** `scripts/check_fingerprint_equivalence.py`
+re-ingests a fixed synthetic corpus and compares graph structure
+(node IDs, edge tuples, payload fields) against a pinned baseline —
+tolerates sub-ULP float drift in `holds_preference` edge weights that
+batched transformer inference produces. Use this, not a raw msgpack
+hash, when verifying that a perf change preserves semantics.

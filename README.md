@@ -71,6 +71,12 @@ pip install -e .
 python -m pytest tests/ -q
 ```
 
+Profile ingestion end-to-end (per-stage wall-clock, JSON artifact under `profiling/`):
+
+```bash
+python scripts/profile_ingestion.py --n-memories 40
+```
+
 The benchmark agent's answerer (Ollama with `llama3.1:8b`) lives in the benchmark repo, not here.
 
 ## License
