@@ -110,13 +110,13 @@ Dataset access (LongMemEval-s, LOCOMO) is owned by the external `agent-memory-be
 
 ## Status & Next Steps
 
-**Current state.** Verification skeleton complete (manifesto, module scaffolds, `MemorySystem` protocol, fingerprint-discipline CI). Tier-1 ingestion implementation has landed (`engram/ingestion/` with schema, graph, persist, six extractors, pipeline, factory, and `EngramGraphMemorySystem`). The Tier-1 implementation predates this architecture pivot — it uses Session/Turn as inputs and has an `answer_question` stub that raises `NotImplementedError`. The patches described below bring it in line with the new design.
+**Current state.** Ingestion is complete through PR-D (patches 1–7 of `docs/design/ingestion.md §12`): post-pivot `MemorySystem` protocol (`ingest` / `recall` / `reset` / `save_state` / `load_state`), R16 primary-data discipline, n-gram granularity + layer labels, granule embeddings + parallel vector index, TimeAnchor nodes + `temporal_at` edges, and the derived-rebuild orchestrator (aliases, co-occurrence, reinforcement, current-preference, TimeAnchor chain). `recall()` raises `NotImplementedError` — the implementation lands in PR-E.
 
 **Where design attention goes next.**
 
-1. **Ingestion patch** — surface change from `ingest_session(session, conversation_id)` to `ingest(memory)`; introduce n-gram granularity; add granule embedding storage + vector index; remove primary-data mutations (Entity alias growth, Claim relabeling); promote co-occurrence to derived; add TimeAnchor nodes and `temporal_at` edges; add the 5-layer label scheme.
-2. **Recall design + implementation** — `docs/design/recall.md` is the next design doc; implementation follows once locked.
-3. **Diagnostics design** — R15 classifier over `(AnswerResult, gold_annotations)`, oracle subgraph computation, `needle_recall@k` / `granule_density` / `completeness` metrics, extraction-coverage reports, K7 fingerprint audits.
+1. **Recall implementation** — `docs/design/recall.md` is locked; the greenfield `engram/recall/` module (intent classifier, seeding, expansion, scoring, assembly) is next.
+2. **Diagnostics design** — R15 classifier over `(RecallResult, gold_annotations)`, oracle subgraph computation, `needle_recall@k` / `granule_density` / `completeness` metrics, extraction-coverage reports, K7 fingerprint audits.
+3. **Follow-ups** — ChangeEvent + EpisodicNode derived indexes; co-occurrence windows beyond per-Memory; calibration of provisional thresholds (`ngram_min_tokens`, `canonicalization_match_threshold`, `preference_discrimination_margin`).
 
 Every design-phase PR cites the rule(s) it implements or the M1 hypothesis (target bucket, expected pp gain, mechanism, validation threshold, falsification condition) it tests.
 

@@ -11,12 +11,12 @@ which implements the ``MemorySystem`` protocol verbs (``ingest``,
 :mod:`.extractors`, :mod:`.preferences` — are not part of the external
 contract.
 
-**Owns (primary).** Memory + Turn granule emission, segmentation, NER,
-entity canonicalization, claim + preference extraction, ingestion
-fingerprinting. N-gram extraction (PR-B), granule embeddings (PR-C),
-TimeAnchor nodes (PR-D), and derived-index rebuilds — co-occurrence, alias
-sets, reinforcement counts, current-truth, episodic clusters — land in
-later patches per ``docs/design/ingestion.md §12``.
+**Owns (primary).** Memory + Turn granule emission, segmentation, N-gram
+extraction, NER, entity canonicalization, claim + preference extraction,
+granule embeddings, TimeAnchor nodes + ``temporal_at`` edges, and the
+derived-rebuild orchestrator (alias sets, co-occurrence, reinforcement
+counts, current-truth, TimeAnchor chain). Episodic clusters + ChangeEvents
+remain deferred per ``docs/design/ingestion.md §7 D5–D6``.
 
 **Does not touch.** Query text, answer generation, benchmark orchestration
 (lives in the external ``agent-memory-benchmark`` repo), judge prompts,

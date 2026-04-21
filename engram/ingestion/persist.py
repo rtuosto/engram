@@ -19,6 +19,10 @@ single-file primary contract.
   (``embeddings.npy`` + ``node_ids.json``). The primary msgpack payload is
   shape-compatible with v1, but we bump the schema so a v1 save without
   the embedding sidecar can't silently load as a v2-capable instance.
+- v3 (PR-D): adds :class:`TimeAnchorPayload` to the kind registry and
+  ``surface_form`` to :class:`EdgeAttrs`. v2 saves without the field are
+  rejected (``_decode_value`` enforces "all declared fields present") —
+  reingest rather than migrate.
 """
 
 from __future__ import annotations
@@ -39,11 +43,12 @@ from engram.ingestion.schema import (
     MemoryPayload,
     NgramPayload,
     PreferencePayload,
+    TimeAnchorPayload,
     TurnPayload,
     UtteranceSegmentPayload,
 )
 
-SCHEMA_VERSION: Final[int] = 2
+SCHEMA_VERSION: Final[int] = 3
 MEMORY_SYSTEM_ID: Final[str] = "engram_graph"
 
 # Dataclass kind registry — each payload declares a stable string so the
@@ -57,6 +62,7 @@ _KIND_TO_CLS: Final[dict[str, type]] = {
     "entity": EntityPayload,
     "claim": ClaimPayload,
     "preference": PreferencePayload,
+    "time_anchor": TimeAnchorPayload,
     "event": EventPayload,
     "episode": EpisodePayload,
     "edge_attrs": EdgeAttrs,

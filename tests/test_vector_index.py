@@ -412,7 +412,9 @@ def test_memory_system_save_state_writes_embeddings_sidecar(tmp_path: Path) -> N
 
     manifest = json.loads((tmp_path / MANIFEST_FILENAME).read_text(encoding="utf-8"))
     assert manifest["has_embeddings"] is True
-    assert manifest["schema_version"] == 2
+    from engram.ingestion.persist import SCHEMA_VERSION as _SCHEMA_VERSION
+
+    assert manifest["schema_version"] == _SCHEMA_VERSION
 
     # Roundtrip the whole system and confirm the vector index restored.
     restored = EngramGraphMemorySystem(config=config, pipeline=pipeline)

@@ -5,6 +5,88 @@
 
 ---
 
+## Session: 2026-04-20 — PR-D (TimeAnchor + derived-rebuild orchestrator)
+
+### What Was Done
+
+Landed PR-D on `feat/pr-d-temporal-derived`. Patches 6 + 7 from `docs/design/ingestion.md §12`:
+
+**Patch 6 — TimeAnchor + `temporal_at` edges.**
+- New `LABEL_TIME_ANCHOR` + `TimeAnchorPayload` + `time_anchor_identity(iso_timestamp)`.
+- `EDGE_TEMPORAL_AT` promoted into `TIER_1_EDGE_TYPES`; `EDGE_TEMPORAL_BEFORE`/`EDGE_TEMPORAL_AFTER` + `EDGE_CO_OCCURS_WITH` moved to a "derived edges" block with the comment that they live in sidecars, not the graph, in PR-D.
+- `round_iso_timestamp(iso, resolution)` helper — supports `second | minute | hour | day`; preserves trailing "Z" suffix; preserves `+HH:MM` offsets; raises `ValueError` on unknown resolution or malformed timestamp.
+- `MemoryConfig.time_anchor_resolution: str = "second"`, categorized under `_INGESTION_FIELDS`.
+- `EdgeAttrs` gains `surface_form: str | None = None`. Populated on `mentions` edges so the derived alias-rebuild can walk entity-inbound mentions without replaying NER.
+- Pipeline stage [9]: after granule embedding, emit (or reuse) a TimeAnchor for `memory.timestamp` (rounded) and attach `temporal_at` edges from every granule and relationship created on this ingest. Anchors carry `{temporal}` layer. Fails closed when `memory.timestamp is None`.
+- Anchor sources tracked via `anchor_sources: list[str]` accumulator; stage [9] sorts + dedupes before edge emission (R2-stable).
+
+**Patch 7 — derived-rebuild orchestrator.**
+- New `engram/ingestion/derived.py` (487 lines). Five sidecar indexes, all frozen + slotted:
+  - `AliasEntry` — per Entity, sorted distinct surface forms from inbound `mentions.surface_form`.
+  - `CoOccurrenceEntry` — per Entity-pair (lexicographically ordered), per-Memory co-occurrence count + normalized weight.
+  - `ReinforcementEntry` — per Claim / Preference, count of inbound observation edges + earliest / latest `asserted_at`.
+  - `CurrentPreferenceEntry` — per `(holder_id, target_key)`, the most recent Preference observation (ISO-timestamp order, `node_id` tiebreak). `target_key` is `entity:<id>` or `literal:<text>`.
+  - `TimeAnchorChainEntry` — TimeAnchors sorted by ISO, each carrying `prev_id` / `next_id` links.
+- `rebuild_derived(store, config)` — idempotent composer; builds all five indexes in one pass.
+- `derived_fingerprint(config, store) = sha256(ingestion_fp || derivation_version || "nodes:edges")[:16]`. Append-only primary means node + edge counts are a collision-safe change detector.
+- `dump_derived(index) / load_derived(bytes)` — msgpack envelope with `schema_version=1`, `derivation_version=1`, `DerivedFormatError` on mismatch.
+- ChangeEvent + EpisodicNode explicitly deferred (manifesto §7 D5, D6) — noted in module docstring.
+
+**System integration.**
+- `InstanceState.derived: DerivedIndex | None` — cached snapshot, populated by an explicit rebuild.
+- `EngramGraphMemorySystem.rebuild_derived() -> DerivedIndex | None` — public sync method (returns `None` when no state yet). Recall (PR-E) will call this lazily on entry.
+- `save_state` now writes `derived/snapshot.msgpack` when a snapshot is cached; manifest gains `has_derived: bool` + `derived_fingerprint: str | None`.
+- `load_state` reads the sidecar when declared, recomputes the expected fingerprint against the freshly-loaded primary, and drops the snapshot if stale (so a rebuild regenerates on next use).
+
+**Persistence rename + schema bump.**
+- `SCHEMA_VERSION: 2 → 3`. Needed because `EdgeAttrs` gained a field (`surface_form`); v2 saves are rejected at envelope level, no migration shim.
+- `persist._KIND_TO_CLS` gains `"time_anchor": TimeAnchorPayload`.
+- `memory_version: 0.3.0 → 0.4.0`.
+- Filename constants: `DERIVED_DIRNAME = "derived"`, `DERIVED_SNAPSHOT_FILENAME = "snapshot.msgpack"`.
+
+**Tests.**
+- `tests/test_time_anchor.py` — 14 tests. Rounding units across all four resolutions, malformed-input rejection, content-addressing, repeat-ingest convergence, distinct rounded moments, per-granule + per-relationship `temporal_at` edges, timestamp-less ingest fails closed, day-resolution collapses intraday.
+- `tests/test_derived.py` — 16 tests. Rebuild idempotency (R17), fingerprint responds to config changes + primary growth, alias collection dedupes surfaces and omits un-mentioned entities, co-occurrence pair counts + sort order + empty case, reinforcement bounds, current-preference latest-wins across polarity flip, temporal-chain prev/next linkage, dump/load roundtrip + byte-stability + schema-mismatch rejection, end-to-end `rebuild_derived()` caching + save/load persistence.
+
+Updated `tests/test_vector_index.py` to read `SCHEMA_VERSION` from `engram.ingestion.persist` instead of hard-coding `2` (so future bumps don't require test edits).
+
+Test suite: 178 passing (was 148 on PR-C); ruff clean; mypy 16 pre-existing errors (unchanged).
+
+### Current State
+
+- Branch: `feat/pr-d-temporal-derived` (open; not yet PR'd against main)
+- `main` at `d2ff48e` — PR-C merged
+- Tests: 178 passing, ruff clean, mypy 16 pre-existing errors
+- Build: `pip install -e .` unchanged
+- `SCHEMA_VERSION = 3`. v1 / v2 saves are rejected on load.
+
+### What's Next
+
+**Immediate:** open PR-D → main → merge.
+
+Then the remaining roadmap:
+
+1. ~~**PR-B** — n-gram granularity + layer labels.~~
+2. ~~**PR-C** — granule embeddings + parallel vector index.~~
+3. ~~**PR-D** — TimeAnchor + derived-rebuild orchestrator.~~ (this session)
+4. **PR-E** — recall implementation (greenfield `engram/recall/`).
+
+### Open Questions
+
+- Co-occurrence window currently is "all-time at Memory granularity." Design §14 lists `(1 hour, 1 day, all-time)` as the target — left as a follow-up calibration PR since recall doesn't depend on per-window weights yet.
+- ChangeEvent / EpisodicNode node types remain declared (`LABEL_EVENT`, `LABEL_EPISODE`) but unemitted. Adding them is a standalone PR once recall lands and has an appetite for their shape.
+- Derived sidecar persistence is one msgpack file (`snapshot.msgpack`) covering all five indexes. The design's §11 layout lists separate files per index — no functional difference; the one-file layout is simpler and rebuild is the atomic unit. Can be split later without changing the public contract.
+- `primary_state_signature` is `nodes:edges`. R16 append-only makes this collision-safe today; if we ever introduce derived-edge emission into the graph (we don't in PR-D), this needs to swap to a content digest.
+
+### Gotchas
+
+- `surface_form` is on `EdgeAttrs` now — any test that builds `EdgeAttrs` directly for `mentions` edges and expects the alias index to pick it up must pass `surface_form=...`. The derived tests do this; existing tests that don't need aliases are untouched.
+- `load_state` silently drops a stale derived snapshot (primary-signature mismatch) rather than raising. Recall-side callers should expect `state.derived` to potentially be `None` after load and call `rebuild_derived()` to regenerate.
+- `time_anchor_identity` is scoped to the *rounded* ISO timestamp string. Changing `time_anchor_resolution` mid-corpus would duplicate anchors for the same wall-clock moment — `ingestion_fingerprint` covers this so fingerprint-aware caches will invalidate.
+- Preference `target_key` in the current-preference index uses the literal string prefix `entity:` or `literal:`. Recall consumers must compose this same way when looking up "does Alice currently like pizza." Helper could be exposed; left inline for now.
+
+---
+
 ## Session: 2026-04-20 — PR-C (granule embeddings + parallel vector index)
 
 ### What Was Done

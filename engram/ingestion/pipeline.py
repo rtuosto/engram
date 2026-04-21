@@ -10,6 +10,7 @@ Pipeline order (``docs/design/ingestion.md §6``):
 6. Claim extraction
 7. Preference detection (fails closed per polarity gate)
 8. Granule embedding (Turn + Sentence + N-gram → parallel vector index)
+9. Temporal anchoring (TimeAnchor + ``temporal_at`` edges)
 
 Per-instance state (:class:`InstanceState`) owns the GraphStore, the
 parallel :class:`VectorIndex`, and the working caches (EntityRegistry,
@@ -40,6 +41,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from engram.config import MemoryConfig
+from engram.ingestion.derived import DerivedIndex
 from engram.ingestion.extractors.canonicalization import (
     EntityRegistry,
     canonicalize,
@@ -66,25 +68,31 @@ from engram.ingestion.schema import (
     EDGE_HOLDS_PREFERENCE,
     EDGE_MENTIONS,
     EDGE_PART_OF,
+    EDGE_TEMPORAL_AT,
     LABEL_CLAIM,
     LABEL_ENTITY,
     LABEL_MEMORY,
     LABEL_NGRAM,
     LABEL_PREFERENCE,
+    LABEL_TIME_ANCHOR,
     LABEL_TURN,
     LABEL_UTTERANCE_SEGMENT,
     LAYER_ENTITY,
     LAYER_RELATIONSHIP,
+    LAYER_TEMPORAL,
     ClaimPayload,
     EdgeAttrs,
     EntityPayload,
     MemoryPayload,
     NgramPayload,
+    TimeAnchorPayload,
     TurnPayload,
     entity_identity,
     memory_identity,
     node_id,
+    round_iso_timestamp,
     segment_identity,
+    time_anchor_identity,
     turn_identity,
 )
 from engram.ingestion.vector_index import (
@@ -119,6 +127,9 @@ class InstanceState:
     speaker_to_entity_id: dict[str, str] = field(default_factory=dict)
     memory_index: int = 0
     vector_index: VectorIndex | None = None
+    # Cached derived-rebuild snapshot. ``None`` until the first rebuild.
+    # Staleness is detected via fingerprint; mutation is never in-place.
+    derived: DerivedIndex | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,11 +206,18 @@ class IngestionPipeline:
         # graph writes are done.
         granule_batch: list[tuple[str, str, str]] = []
 
+        # Anchoring accumulator — granule + relationship node_ids created on
+        # this ingest that should receive ``temporal_at`` edges at stage [9].
+        # Order is insertion order; the emit call sorts at the edge site so
+        # the final edge stream is R2-stable.
+        anchor_sources: list[str] = []
+
         # [1] Memory + Turn granule.
         memory_id, memory_payload = self._emit_memory(state, memory)
         turn_id, _ = self._emit_turn_granule(
             state, memory_id, memory, granule_batch=granule_batch
         )
+        anchor_sources.append(turn_id)
 
         # [2] spaCy process the Memory's content.
         docs = self._nlp_process([memory.content])
@@ -207,6 +225,9 @@ class IngestionPipeline:
             # Turn granule exists but has no sentences / n-grams — still embed
             # the whole-Memory representation so recall can find it.
             self._emit_granule_embeddings(state, granule_batch)
+            self._emit_time_anchor(
+                state, memory, anchor_sources=anchor_sources, memory_id=memory_id
+            )
             return
         doc = docs[0]
 
@@ -214,11 +235,13 @@ class IngestionPipeline:
         segments = self._emit_segments(
             state, turn_id, doc, memory_id=memory_id, granule_batch=granule_batch
         )
+        anchor_sources.extend(seg.segment_id for seg in segments)
 
         # [4] N-gram extraction (noun_chunk + SVO).
-        self._emit_ngrams(
+        ngram_ids = self._emit_ngrams(
             state, doc, segments, memory_id=memory_id, granule_batch=granule_batch
         )
+        anchor_sources.extend(ngram_ids)
 
         # [5] NER.
         mentions = extract_mentions(doc, turn_id)
@@ -244,13 +267,22 @@ class IngestionPipeline:
         )
 
         # [7] — claim extraction + preference detection per sentence.
-        self._extract_claims_and_preferences(
+        claim_pref_ids = self._extract_claims_and_preferences(
             state, work, asserted_at=memory.timestamp
         )
+        anchor_sources.extend(claim_pref_ids)
 
         # [8] — granule embedding. One batched call per ingest; rows appended
         # to state.vector_index in insertion order.
         self._emit_granule_embeddings(state, granule_batch)
+
+        # [9] — temporal anchoring. TimeAnchor node + ``temporal_at`` edges
+        # from every granule + relationship created on this ingest. Skipped
+        # silently when ``memory.timestamp`` is None (fails closed — there is
+        # no anchor to attach to).
+        self._emit_time_anchor(
+            state, memory, anchor_sources=anchor_sources, memory_id=memory_id
+        )
 
     # ------------------------------------------------------------------
     # Internals
@@ -375,7 +407,7 @@ class IngestionPipeline:
         *,
         memory_id: str,
         granule_batch: list[tuple[str, str, str]],
-    ) -> None:
+    ) -> list[str]:
         """Emit N-gram nodes (noun chunks + SVO triples) with ``part_of``
         edges to their containing Sentence granule.
 
@@ -386,7 +418,7 @@ class IngestionPipeline:
         the parallel embedding index landing in PR-C).
         """
         if not segments:
-            return
+            return []
         min_tokens = self._config.ngram_min_tokens
         segment_spans: list[tuple[tuple[int, int], str]] = [
             (seg.char_span, seg.segment_id) for seg in segments
@@ -409,6 +441,7 @@ class IngestionPipeline:
         # appending to the embedding batch so the vector index rejects
         # duplicates that never make it into the graph.
         seen_ngram_ids: set[str] = set()
+        emitted: list[str] = []
         for ngram_id, payload in all_ngrams:
             if ngram_id in seen_ngram_ids:
                 continue
@@ -429,6 +462,8 @@ class IngestionPipeline:
                 ),
             )
             granule_batch.append((ngram_id, GRANULARITY_NGRAM, payload.surface_form))
+            emitted.append(ngram_id)
+        return emitted
 
     def _emit_granule_embeddings(
         self,
@@ -500,6 +535,7 @@ class IngestionPipeline:
                 source_memory_id=memory_id,
                 source_turn_id=turn_id,
                 asserted_at=asserted_at,
+                surface_form=mention.surface_form,
             ),
         )
         return entity_id
@@ -531,7 +567,11 @@ class IngestionPipeline:
         work: _MemoryWork,
         *,
         asserted_at: str | None,
-    ) -> None:
+    ) -> list[str]:
+        """Returns the list of Claim + Preference node IDs emitted on this
+        ingest (de-duplicated in insertion order). Used by stage [9] to
+        attach ``temporal_at`` edges to freshly observed relationships.
+        """
         resolved = [
             ResolvedMention(
                 entity_id=work.entity_id_by_span[(m.char_span[0], m.char_span[1])],
@@ -540,6 +580,15 @@ class IngestionPipeline:
             for m in work.mentions
             if (m.char_span[0], m.char_span[1]) in work.entity_id_by_span
         ]
+
+        emitted_ids: list[str] = []
+        seen: set[str] = set()
+
+        def _record(node_id_: str) -> None:
+            if node_id_ in seen:
+                return
+            seen.add(node_id_)
+            emitted_ids.append(node_id_)
 
         for seg in work.segments:
             sent = seg.sent
@@ -560,13 +609,17 @@ class IngestionPipeline:
 
             for claim_id, claim_payload in claims:
                 self._emit_claim(state, work, claim_id, claim_payload, asserted_at=asserted_at)
-                self._maybe_emit_preference(
+                _record(claim_id)
+                pref_id = self._maybe_emit_preference(
                     state,
                     work,
                     claim_payload=claim_payload,
                     sentence_text=sent_text,
                     asserted_at=asserted_at,
                 )
+                if pref_id is not None:
+                    _record(pref_id)
+        return emitted_ids
 
     def _emit_claim(
         self,
@@ -622,7 +675,7 @@ class IngestionPipeline:
         claim_payload: ClaimPayload,
         sentence_text: str,
         asserted_at: str | None,
-    ) -> None:
+    ) -> str | None:
         verdict = classify(
             sentence_text,
             self._centroids,
@@ -631,7 +684,7 @@ class IngestionPipeline:
             enabled_polarities=self._enabled_polarities,
         )
         if verdict is None:
-            return
+            return None
         pref_id, pref_payload = build_preference_payload(
             verdict,
             claim_payload=claim_payload,
@@ -665,6 +718,64 @@ class IngestionPipeline:
                     source_memory_id=work.memory_id,
                     source_turn_id=work.turn_id,
                     asserted_at=asserted_at,
+                ),
+            )
+        return pref_id
+
+
+    def _emit_time_anchor(
+        self,
+        state: InstanceState,
+        memory: Memory,
+        *,
+        anchor_sources: list[str],
+        memory_id: str,
+    ) -> None:
+        """Stage [9]: emit (or reuse) a TimeAnchor node for the Memory's
+        timestamp and attach ``temporal_at`` edges from every granule and
+        relationship created on this ingest.
+
+        Fails closed when ``memory.timestamp`` is ``None`` — no anchor is
+        created and no edges are emitted. The temporal layer is opt-in per
+        observation, not a runtime precondition.
+
+        Anchors are content-addressed by the rounded ISO timestamp (see
+        :func:`engram.ingestion.schema.round_iso_timestamp`), so repeat
+        ingests at the same rounded moment converge onto one node. ``R16``:
+        the anchor's payload is never mutated — two observations at the
+        same instant share the node via incoming edges, which is the
+        R16-legal form of "reinforcement."
+        """
+        if memory.timestamp is None or not anchor_sources:
+            return
+
+        rounded = round_iso_timestamp(
+            memory.timestamp, self._config.time_anchor_resolution
+        )
+        anchor_id = node_id(time_anchor_identity(rounded))
+        state.store.add_node(
+            anchor_id,
+            labels=frozenset({LABEL_TIME_ANCHOR}),
+            payloads={LABEL_TIME_ANCHOR: TimeAnchorPayload(iso_timestamp=rounded)},
+            layers=frozenset({LAYER_TEMPORAL}),
+        )
+        # Dedup + sort for R2-stable edge iteration: even though
+        # ``anchor_sources`` is already insertion-ordered, subsequent walks
+        # over ``MultiDiGraph`` sort by (src, dst, key), so only the dedup
+        # matters. Sorting here additionally guards against insertion-order
+        # drift between the pipeline and downstream test fixtures.
+        for src_id in sorted(set(anchor_sources)):
+            if not state.store.has_node(src_id):
+                continue
+            state.store.add_edge(
+                src_id,
+                anchor_id,
+                EdgeAttrs(
+                    type=EDGE_TEMPORAL_AT,
+                    weight=1.0,
+                    source_memory_id=memory_id,
+                    source_turn_id=src_id,
+                    asserted_at=rounded,
                 ),
             )
 

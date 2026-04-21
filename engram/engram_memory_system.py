@@ -32,6 +32,14 @@ from pathlib import Path
 from typing import Final
 
 from engram.config import MemoryConfig
+from engram.ingestion.derived import (
+    DerivedFormatError,
+    DerivedIndex,
+    derived_fingerprint,
+    dump_derived,
+    load_derived,
+    rebuild_derived,
+)
 from engram.ingestion.persist import (
     MEMORY_SYSTEM_ID,
     SCHEMA_VERSION,
@@ -48,6 +56,8 @@ MANIFEST_FILENAME: Final[str] = "manifest.json"
 PRIMARY_FILENAME: Final[str] = "primary.msgpack"
 EMBEDDINGS_FILENAME: Final[str] = "embeddings.npy"
 NODE_IDS_FILENAME: Final[str] = "node_ids.json"
+DERIVED_DIRNAME: Final[str] = "derived"
+DERIVED_SNAPSHOT_FILENAME: Final[str] = "snapshot.msgpack"
 
 
 class EngramGraphMemorySystem:
@@ -59,7 +69,7 @@ class EngramGraphMemorySystem:
     """
 
     memory_system_id: str = MEMORY_SYSTEM_ID
-    memory_version: str = "0.3.0"
+    memory_version: str = "0.4.0"
 
     def __init__(
         self,
@@ -98,6 +108,22 @@ class EngramGraphMemorySystem:
     async def reset(self) -> None:
         self._state = None
 
+    def rebuild_derived(self) -> DerivedIndex | None:
+        """Rebuild the derived-index snapshot and cache it on ``InstanceState``.
+
+        Idempotent: re-running on unchanged primary returns a snapshot with
+        the same fingerprint as the previous rebuild (``R17``).
+
+        Returns ``None`` when no state exists yet (no ingests). Recall (PR-E)
+        will call this lazily on its entry path; for now it's exposed as a
+        sync method so tests and diagnostic callers can exercise the path.
+        """
+        if self._state is None:
+            return None
+        snapshot = rebuild_derived(self._state.store, config=self._config)
+        self._state.derived = snapshot
+        return snapshot
+
     async def save_state(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         ingestion_fingerprint = self._config.ingestion_fingerprint()
@@ -108,6 +134,8 @@ class EngramGraphMemorySystem:
             and self._state.vector_index is not None
             and len(self._state.vector_index) > 0
         )
+        has_derived = self._state is not None and self._state.derived is not None
+        derived_fp: str | None = None
 
         if self._state is not None:
             (path / PRIMARY_FILENAME).write_bytes(dump_state(self._state.store))
@@ -117,6 +145,14 @@ class EngramGraphMemorySystem:
                 path / EMBEDDINGS_FILENAME,
                 path / NODE_IDS_FILENAME,
             )
+        if has_derived:
+            assert self._state is not None and self._state.derived is not None
+            derived_dir = path / DERIVED_DIRNAME
+            derived_dir.mkdir(parents=True, exist_ok=True)
+            (derived_dir / DERIVED_SNAPSHOT_FILENAME).write_bytes(
+                dump_derived(self._state.derived)
+            )
+            derived_fp = self._state.derived.fingerprint
 
         manifest = {
             "memory_system_id": self.memory_system_id,
@@ -125,6 +161,8 @@ class EngramGraphMemorySystem:
             "ingestion_fingerprint": ingestion_fingerprint,
             "has_primary": has_primary,
             "has_embeddings": has_embeddings,
+            "has_derived": has_derived,
+            "derived_fingerprint": derived_fp,
         }
         (path / MANIFEST_FILENAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -173,6 +211,25 @@ class EngramGraphMemorySystem:
                 )
             state.vector_index = VectorIndex.load(embeddings_path, node_ids_path)
 
+        if manifest.get("has_derived", False):
+            derived_path = path / DERIVED_DIRNAME / DERIVED_SNAPSHOT_FILENAME
+            if not derived_path.exists():
+                raise PersistFormatError(
+                    "manifest declared has_derived=True but derived snapshot "
+                    f"file is missing under {path}"
+                )
+            try:
+                loaded = load_derived(derived_path.read_bytes())
+            except DerivedFormatError as exc:
+                raise PersistFormatError(f"derived snapshot: {exc}") from exc
+            # Fingerprint audit: if the persisted derived fingerprint doesn't
+            # match the one we'd compute against the freshly-loaded primary,
+            # the snapshot is stale — drop it so the next recall rebuilds.
+            expected = derived_fingerprint(self._config, store)
+            if loaded.fingerprint == expected:
+                state.derived = loaded
+            # else: silently discard; a rebuild on next use regenerates.
+
         # memory_index is not restored from persisted primary — the graph
         # already reflects every ingested Memory. A follow-up ingest
         # continues from `state.memory_index + max-observed-index`; for
@@ -199,6 +256,8 @@ class EngramGraphMemorySystem:
 
 
 __all__ = [
+    "DERIVED_DIRNAME",
+    "DERIVED_SNAPSHOT_FILENAME",
     "EMBEDDINGS_FILENAME",
     "EngramGraphMemorySystem",
     "MANIFEST_FILENAME",

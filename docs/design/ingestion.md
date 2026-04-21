@@ -493,41 +493,43 @@ Feature infrastructure wired for embedding similarity + co-occurrence as additio
 
 The Tier-1 implementation already shipped (`engram/ingestion/{schema,graph,persist,extractors,pipeline,factory}.py` + `engram_memory_system.py`). It uses `Session`/`Turn`/`conversation_id` as inputs and has `answer_question` as a stub. The architecture pivot doesn't require a rewrite — it requires a sequence of patches.
 
-**Patch 1 — protocol surface (smallest, highest priority).**
+**Status: patches 1–7 are shipped (PR-A / PR-B / PR-C / PR-D). `recall()` still raises `NotImplementedError`; PR-E implements it.**
+
+**Patch 1 — protocol surface (smallest, highest priority).** *(shipped — PR-A)*
 - `MemorySystem` protocol: drop `answer_question`, drop `finalize_conversation`, drop `conversation_id` from all verbs. Add `recall(query, *, now, timezone, max_results)`. Rename `ingest_session(session, conversation_id)` → `ingest(memory)`.
 - `Memory` dataclass added to `engram/models.py`. `Session` and `Turn` retained as optional helper types (the benchmark may use them to build Memories), but no longer required by the protocol.
 - `EngramGraphMemorySystem`: adapt internal state to one-instance-one-memory; `reset` clears everything.
 - Fingerprint-discipline test updated.
 
-**Patch 2 — drop primary-data mutations (R16 enforcement).**
+**Patch 2 — drop primary-data mutations (R16 enforcement).** *(shipped — PR-A)*
 - `EntityPayload.aliases` removed. Alias collection moves to derived.
 - Claim → Preference label-merging removed. Preferences become separate content-addressed nodes linked by `holds_preference` from the speaker entity.
 - Co-occurrence accumulator promoted to derived.
 
-**Patch 3 — add n-gram granularity.**
+**Patch 3 — add n-gram granularity.** *(shipped — PR-B)*
 - New `extractors/ngram.py` running `doc.noun_chunks` + a small dep-subtree SVO extractor.
 - New `NgramPayload` dataclass.
 - N-gram nodes + `part_of` edges from N-gram → Sentence in the pipeline.
 
-**Patch 4 — add granule embedding storage + parallel vector index.**
+**Patch 4 — add granule embedding storage + parallel vector index.** *(shipped — PR-C)*
 - New `engram/ingestion/vector_index.py` wrapping the `numpy` matrix + node-id list.
 - Pipeline computes MiniLM embeddings for every granule (Turn, Sentence, N-gram) and inserts into the index.
 - `dump_conversation` / `load_conversation` rename → `dump_state` / `load_state`; vector index serializes alongside.
 - `SCHEMA_VERSION` bumps to 2.
 
-**Patch 5 — add layer labels.**
+**Patch 5 — add layer labels.** *(shipped — PR-B)*
 - Each node gets a `layers: frozenset[str]` attribute populated by the extractor.
 - `GraphStore.nodes_by_layer(label)` helper for recall-side use.
 
-**Patch 6 — TimeAnchor + temporal layer.**
+**Patch 6 — TimeAnchor + temporal layer.** *(shipped — PR-D)*
 - New TimeAnchor node + `temporal_at` edges from observations.
-- `temporal_before` / `temporal_after` between TimeAnchors moves to derived rebuild.
+- `temporal_before` / `temporal_after` between TimeAnchors moves to derived rebuild (lives on the derived `TimeAnchorChainEntry`, not as graph edges in PR-D).
 
-**Patch 7 — derived-rebuild orchestrator.**
-- New `engram/ingestion/derived.py` with `rebuild_derived(state)`.
-- Co-occurrence, alias sets, reinforcement counts, current-truth index implemented.
-- ChangeEvent + EpisodicNode in a follow-up patch.
-- Lazy trigger: `recall` checks derived_fingerprint and rebuilds if stale.
+**Patch 7 — derived-rebuild orchestrator.** *(shipped — PR-D)*
+- New `engram/ingestion/derived.py` with `rebuild_derived(store, *, config)`.
+- Co-occurrence, alias sets, reinforcement counts, current-truth index, and TimeAnchor chain implemented.
+- ChangeEvent + EpisodicNode remain deferred to a follow-up PR (not blocking recall v1).
+- Lazy trigger: recall (PR-E) will check `state.derived.fingerprint` against `derived_fingerprint(config, store)` and call `rebuild_derived` if stale. `EngramGraphMemorySystem.rebuild_derived()` is exposed now for tests and diagnostics.
 
 Each patch is its own PR with R3 fingerprint coverage, an R2 audit run, and at least one test exercising the new behavior.
 
