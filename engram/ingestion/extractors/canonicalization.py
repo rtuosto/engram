@@ -25,7 +25,7 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass
 
-from rapidfuzz.fuzz import token_set_ratio  # type: ignore[import-untyped]
+from rapidfuzz.fuzz import token_set_ratio
 
 from engram.ingestion.extractors.ner import EntityMention
 from engram.ingestion.schema import (

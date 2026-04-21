@@ -33,6 +33,7 @@ from __future__ import annotations
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import cast
 
 from engram.ingestion.schema import (
     NGRAM_KIND_NOUN_CHUNK,
@@ -232,7 +233,7 @@ def extract_svo_ngrams(
 def _first_child(token: object, deps: set[str]) -> object | None:
     for child in getattr(token, "children", ()):
         if getattr(child, "dep_", "") in deps:
-            return child
+            return cast("object", child)
     return None
 
 
