@@ -1,9 +1,12 @@
-"""Verification step 2: four module dirs importable with boundary docstrings.
+"""Verification step 2: three module dirs importable with boundary docstrings.
 
-Each top-level module (``ingestion``, ``recall``, ``benchmarking``,
-``diagnostics``) must be importable and carry a non-empty module docstring.
-The docstring is the top-of-module boundary contract — deleting it is a
-boundary violation that this test catches.
+Each top-level module (``ingestion``, ``recall``, ``diagnostics``) must be
+importable and carry a non-empty module docstring. The docstring is the
+top-of-module boundary contract — deleting it is a boundary violation that
+this test catches.
+
+Benchmarking lives in the external ``agent-memory-benchmark`` repo and is not
+imported from this package (``docs/DESIGN-MANIFESTO.md §6``).
 """
 
 from __future__ import annotations
@@ -16,7 +19,6 @@ _MODULES = (
     "engram",
     "engram.ingestion",
     "engram.recall",
-    "engram.benchmarking",
     "engram.diagnostics",
 )
 

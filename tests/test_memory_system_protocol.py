@@ -1,6 +1,7 @@
 """Verification step 3: ``MemorySystem`` protocol has the R1-mandated shape.
 
-The protocol is the single surface Benchmarking and Diagnostics touch
+The protocol is the single surface external callers touch — the
+``agent-memory-benchmark`` repo and this repo's :mod:`engram.diagnostics`
 (``docs/DESIGN-MANIFESTO.md §R1``, ``§6``). This test pins the shape so that
 adding or removing a public verb is an intentional, reviewable change — not a
 silent refactor that breaks the measurement instrument.

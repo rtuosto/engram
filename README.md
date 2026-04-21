@@ -1,8 +1,8 @@
 # engram
 
-A graph-based memory system for LLM agents, benchmarked against LongMemEval and LOCOMO.
+A graph-based memory system for LLM agents. Measured against LongMemEval and LOCOMO by the external [`agent-memory-benchmark`](https://github.com/rtuosto/agent-memory-benchmark) repo, which consumes this package through the `MemorySystem` protocol.
 
-**Status:** pre-implementation. Design contract is in [`docs/DESIGN-MANIFESTO.md`](docs/DESIGN-MANIFESTO.md); technical map is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Code lands only after the six-step Verification checklist in the manifesto is green.
+**Status:** pre-implementation. Design contract is in [`docs/DESIGN-MANIFESTO.md`](docs/DESIGN-MANIFESTO.md); technical map is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Code lands only after the Verification checklist in the manifesto is green.
 
 ## North star
 
@@ -18,10 +18,11 @@ engram is graph-first because the failures are.
 
 - [`engram/ingestion/`](engram/ingestion/) — sessions → graph; deterministic fingerprint.
 - [`engram/recall/`](engram/recall/) — question → subgraph + context + one answerer call.
-- [`engram/benchmarking/`](engram/benchmarking/) — LongMemEval-s (primary) and LOCOMO (validation) orchestration.
 - [`engram/diagnostics/`](engram/diagnostics/) — per-run failure classification and coverage reports.
 
-(All four are pre-implementation; they don't exist yet.)
+Benchmarking (dataset loading, judging, scoring, cache layout, replicate orchestration) lives in the external [`agent-memory-benchmark`](https://github.com/rtuosto/agent-memory-benchmark) repo. It calls into engram through the `MemorySystem` protocol exposed by `engram/__init__.py`.
+
+(All three modules are pre-implementation; only the protocol surface and config exist today.)
 
 ## Design contract
 
@@ -38,11 +39,12 @@ This repo uses the agent-bootstrap contract (see [`CLAUDE.md`](CLAUDE.md)):
 
 ## Local development
 
-To be wired during verification step 5 (benchmark harness). Will require:
+To be wired once ingestion and recall implementations land. Will require:
 
 - Python 3.11+
-- Ollama running locally with `llama3.1:8b` pulled
-- LongMemEval-s and LOCOMO datasets downloaded
+- Ollama running locally with `llama3.1:8b` pulled (answerer lives inside recall)
+
+Dataset downloads and judge invocation are the external benchmark's concern.
 
 ## License
 

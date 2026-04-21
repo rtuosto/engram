@@ -10,8 +10,9 @@ assembled context string, and one answer call.
 English regex), seeding, subgraph expansion, reranking, context assembly, answer
 prompt template (``R13``: one file, template changes reviewed like API changes).
 
-**Does not touch.** Node / edge creation, benchmark scoring, judge prompts, the
-ingestion fingerprint.
+**Does not touch.** Node / edge creation, benchmark scoring (lives in the
+external ``agent-memory-benchmark`` repo), judge prompts, the ingestion
+fingerprint.
 
 **Stability guarantee.** ``answer_fingerprint`` transitively includes
 ``ingestion_fingerprint`` plus every recall-side config field (``R4``).

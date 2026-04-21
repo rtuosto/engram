@@ -51,7 +51,7 @@ class Session:
 
 @dataclass(frozen=True, slots=True)
 class RetrievedNode:
-    """A graph node exposed to Benchmarking / Diagnostics via Recall.
+    """A graph node exposed to external callers (benchmark, Diagnostics) via Recall.
 
     The interior graph may have richer types (Turn, Utterance Segment, Claim,
     Preference, Event, Episode, …). This class is the *projection* that crosses
@@ -81,9 +81,9 @@ class AnswerResult:
     single source of truth for "what did the LLM see". Required for diagnostic
     classification (``R15``) and prompt-miss detection (``M5``).
 
-    ``retrieved_nodes`` is the rank-ordered subgraph projection. Benchmarking
-    uses it for retrieval-side metrics; Diagnostics uses it for extraction- and
-    graph-gap classification.
+    ``retrieved_nodes`` is the rank-ordered subgraph projection. The external
+    benchmark uses it for retrieval-side metrics; Diagnostics uses it for
+    extraction- and graph-gap classification.
 
     ``retrieval_time_ms`` and ``answer_time_ms`` sum to ``total_time_ms`` plus
     any overhead; all three are reported (``K4``).

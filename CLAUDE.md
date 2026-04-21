@@ -242,7 +242,7 @@ If you break something:
 
 ### What engram is
 
-A graph-based memory system for LLM agents, benchmarked against **LongMemEval** and **LOCOMO**. The binding design contract is [`docs/DESIGN-MANIFESTO.md`](docs/DESIGN-MANIFESTO.md) — read it before writing any code. The technical map is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+A graph-based memory system for LLM agents. Measured against **LongMemEval** and **LOCOMO** by a separate `agent-memory-benchmark` repo, which consumes this package through the `MemorySystem` protocol. The binding design contract is [`docs/DESIGN-MANIFESTO.md`](docs/DESIGN-MANIFESTO.md) — read it before writing any code. The technical map is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ### North star
 
@@ -255,14 +255,15 @@ A graph-based memory system for LLM agents, benchmarked against **LongMemEval** 
 - Embeddings: sentence-transformers (model TBD in Ingestion)
 - NLP: spaCy for sentence splitting, NER, dependency parses (enables no-LLM-at-ingest discipline)
 - Storage: graph structure — implementation TBD, must satisfy R2 (determinism) and R12 (versioned persistence)
-- Benchmarks: LongMemEval-s (primary, 100q split), LOCOMO (validation)
+- Benchmarks: LongMemEval-s (primary, 100q split), LOCOMO (validation) — run from the external `agent-memory-benchmark` repo, not from this package.
 
-### Four modules (strict boundaries)
+### Three modules (strict boundaries)
 
 - **`ingestion/`** — sessions → graph. Owns segmentation, NER, canonicalization, claim/preference/event extraction, temporal resolution, edge construction, episode detection, corpus signals, ingestion fingerprint.
 - **`recall/`** — question → subgraph + context + 1 answerer call. Owns intent classification, seeding, expansion, ranking, assembly, answerer prompt.
-- **`benchmarking/`** — dataset orchestration, judging, scoring, caching, replicates. Read-only against `MemorySystem`; never touches the graph.
 - **`diagnostics/`** — failure classification (R15 enum), coverage reports, fingerprint audits. Read-only; never writes to caches or runtime path.
+
+**Benchmarking lives in `agent-memory-benchmark` (separate repo).** It consumes engram through the `MemorySystem` protocol — the only public surface. Never re-implement benchmark orchestration, dataset loading, or judge logic inside this repo.
 
 ### Non-negotiables (excerpts from the manifesto)
 
@@ -276,7 +277,7 @@ A graph-based memory system for LLM agents, benchmarked against **LongMemEval** 
 
 ### Cost discipline
 
-- **No paid APIs** without explicit user approval. Default to Ollama for everything (answerer + judge).
+- **No paid APIs** without explicit user approval. Default to Ollama for the answerer. The judge lives in the external benchmark repo — not a concern here.
 - **No LLM calls in the default ingestion path** (R5). Adding one requires an approved exception.
 
 ### Predecessor repo (reference only — do NOT copy)
@@ -289,7 +290,7 @@ On every memory-affecting change:
 
 1. Write a hypothesis in `.agent/current-plan.md` (M1): target bucket, expected gain, mechanism, validation threshold, falsification condition.
 2. Classify the failure before coding (M5 decision tree): is the gap in extraction, retrieval, or prompt?
-3. Run the per-commit scoreboard from DESIGN-MANIFESTO §K7 (when that infrastructure exists).
+3. Run the per-commit scoreboard from DESIGN-MANIFESTO §K7 via the external `agent-memory-benchmark` repo against your branch.
 4. If claiming an improvement: 3 replicates if the delta is within ±4pp; 5 if within 2×.
 5. Every PR cites the rules(s) it implements or the hypothesis it tests.
 

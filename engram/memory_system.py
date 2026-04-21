@@ -1,19 +1,19 @@
-"""The ``MemorySystem`` protocol — the only surface Benchmarking touches.
+"""The ``MemorySystem`` protocol — the only surface external callers touch.
 
 ``R1``: Single ``MemorySystem`` protocol per experiment family. Only
 ``ingest_session``, ``finalize_conversation``, ``answer_question``, ``reset``,
 ``save_state``, ``load_state`` are public. No sideband hooks that let one
 experiment peek into another's internals.
 
-``P8``: Benchmarking reads only this surface; it never inspects the interior
-graph. Rewrites of the memory system must keep this contract byte-compatible
-or bump a major version — benchmarks are the measurement instrument and must
-remain stable.
+``P8``: The external benchmark reads only this surface; it never inspects the
+interior graph. Rewrites of the memory system must keep this contract
+byte-compatible or bump a major version — the benchmark is the measurement
+instrument and must remain stable.
 
 ``R4``: ``answer_fingerprint`` transitively includes ``ingestion_fingerprint``.
 Fingerprints live on :class:`engram.config.MemoryConfig` (not on the
 ``MemorySystem`` itself) — the protocol below exposes identity/version metadata
-but leaves cache key composition to the Benchmarking module.
+but leaves cache key composition to the external benchmark harness.
 """
 
 from __future__ import annotations
@@ -29,7 +29,8 @@ class MemorySystem(Protocol):
     """Agent-agnostic memory system contract.
 
     Implementations may be graph-backed, embedding-backed, or anything else —
-    only the public verbs below are visible to Benchmarking and Diagnostics.
+    only the public verbs below are visible to external callers (the benchmark
+    harness; this repo's :mod:`engram.diagnostics`).
 
     **Identity.** ``memory_system_id`` is a stable string identifying the
     implementation family (``"engram_graph"``, ``"null"``, …). Cache keys

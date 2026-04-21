@@ -41,7 +41,7 @@ Each principle is a normative statement plus the lesson it encodes. Every design
 
 **P7 — Evidence lives above noise.** Ground-truth noise floor is ±1.73pp; FP non-determinism adds another ±4pp commit-to-commit. A claimed improvement smaller than the noise budget is not an improvement.
 
-**P8 — Benchmarking is a measurement instrument, not a subject of optimization.** If benchmark code, prompts, or judges are tweaked to help the memory system, measurements become non-comparable. Benchmarking is hostile to self-serving changes.
+**P8 — The benchmark is a measurement instrument, not a subject of optimization.** Benchmarking lives in a separate repo (`agent-memory-benchmark`) and calls this package through the `MemorySystem` protocol. If benchmark code, prompts, or judges are tweaked to help the memory system, measurements become non-comparable. The benchmark is hostile to self-serving changes — engram never reaches into it, never reimplements it, never special-cases for it.
 
 **P9 — Diagnose deepest, fix deepest.** On failure, classify the miss first: extraction → retrieval → prompt → answerer. Fix the deepest broken layer. Do not patch an upper layer to compensate for a lower one.
 
@@ -228,7 +228,7 @@ Fix the deepest broken layer (P9). Never patch above to compensate for below.
 
 ## 6. Module Boundaries
 
-Four top-level modules. Each owns a strict slice; cross-module calls go through the public verbs only.
+Three top-level modules inside this repo. Each owns a strict slice; cross-module calls go through the public verbs only. Benchmarking lives in a separate repo (`agent-memory-benchmark`) and consumes engram through the `MemorySystem` protocol.
 
 ### Ingestion
 
@@ -246,13 +246,11 @@ Four top-level modules. Each owns a strict slice; cross-module calls go through 
 - **Does not touch:** node/edge creation, benchmark scoring, judge prompts, the ingestion fingerprint.
 - **Stability:** answer fingerprint transitively covers ingestion fingerprint plus all recall-side config.
 
-### Benchmarking
+### Benchmarking (external — `agent-memory-benchmark` repo)
 
-- **Responsibility:** Run a memory system against LongMemEval-s (primary) and LOCOMO (validation), score, persist, compare.
-- **Public verbs:** `run`, `resume`, `rejudge`, `summarize`, `compare`, `baseline`, `ablation`.
-- **Owns:** dataset loaders, judge abstraction + prompts, run directory layout, scorecard rendering, cache layout, replicate orchestration.
-- **Does not touch:** the memory system's internals. Reads only the `MemorySystem` protocol surface; never inspects the graph.
-- **Stability:** must be bit-stable across memory-system rewrites. Judge or dataset changes require an explicit re-baseline.
+Out of scope for this repository. The external benchmark owns dataset loaders, judge abstraction + prompts, run directory layout, scorecard rendering, cache layout, replicate orchestration, and the `run` / `resume` / `rejudge` / `summarize` / `compare` / `baseline` / `ablation` verbs. It reads only the `MemorySystem` protocol surface and never inspects engram's graph internals. It must be bit-stable across memory-system rewrites; judge or dataset changes there require an explicit re-baseline.
+
+Engram's responsibility is to hold the protocol stable (R1), hold the fingerprints honest (R3/R4), and never "help" the benchmark.
 
 ### Diagnostics
 
@@ -268,17 +266,22 @@ Four top-level modules. Each owns a strict slice; cross-module calls go through 
 
 These files in the sibling `agent-memory` repo encode concepts that survive the rewrite. Read them for shape; do not port code.
 
+**For engram (this repo):**
+
 - `benchmark/memory_interface.py` — `MemorySystem` ABC, `AnswerResult`. Shape of R1.
 - `memory/config.py` — dual-fingerprint discipline. Shape of R3, R4, P6.
-- `benchmark/runner.py` — ingestion/answer/judge cache layering, replicate orchestration, resume semantics. Shape of M3, R12.
-- `benchmark/cache.py` — cache key construction, dataset hashing, prompt fingerprint. Shape of P6.
-- `benchmark/datasets/longmemeval.py`, `benchmark/datasets/locomo.py` — dataset interfaces. Directly informative; reimplement to the same shape.
 - `memory/ingestion/ner.py` — batched GPU NER pattern. Shape of R5 (batching invariant applies even without LLM).
 - `memory/ingestion/episodes.py` — episode clustering concept. Will be promoted to a first-class node.
 - `memory/retrieval/reranker.py` — cross-encoder integration pattern with session diversity + min_unique_sessions.
-- `scripts/diagnose_lme.py` — failure-classification kernel (`retrieval_miss | partial_retrieval | model_miss`). Seed of the Diagnostics taxonomy (R15).
+- `scripts/diagnose_lme.py` — failure-classification kernel (`retrieval_miss | partial_retrieval | model_miss`). Seed of engram's Diagnostics taxonomy (R15).
 - `.agent/lessons.md` — hard-won rules from the predecessor. Ported key entries into this repo's `.agent/lessons.md` as seed lessons.
 - `.agent/architecture-brief.md` (DECISIONS block) — frozen decisions on the predecessor (north star, phase roadmap, cost/model constraints).
+
+**For the external `agent-memory-benchmark` repo (read from there, not engram):**
+
+- `benchmark/runner.py` — ingestion/answer/judge cache layering, replicate orchestration, resume semantics. Shape of M3, R12.
+- `benchmark/cache.py` — cache key construction, dataset hashing, prompt fingerprint. Shape of P6.
+- `benchmark/datasets/longmemeval.py`, `benchmark/datasets/locomo.py` — dataset interfaces.
 
 ---
 
@@ -291,7 +294,7 @@ These files in the sibling `agent-memory` repo encode concepts that survive the 
 - **Do not add an LLM-judge filter between retrieval and the answerer.** P3.
 - **Do not ship aggressive reranker pruning without oracle validation on the affected bucket.** P3, R11.
 - **Do not add a config field without adding it to the correct fingerprint.** P6, R3, R4.
-- **Do not let Benchmarking "help" the memory system.** P8.
+- **Do not let the external benchmark "help" the memory system, and do not reach into it from here.** P8. No conditionals on question-type, dataset, or gold annotations in engram code.
 - **Do not fix the prompt to paper over a retrieval miss, or fix retrieval to paper over an extraction miss.** P9, M5.
 - **Do not claim an improvement smaller than ±1.73pp on a single replicate.** P7, M2, M6.
 - **Do not persist ingestion state via unversioned pickle.** R12.
@@ -308,13 +311,12 @@ These files in the sibling `agent-memory` repo encode concepts that survive the 
 Before any extraction/retrieval implementation lands:
 
 1. **Manifesto approved** (this document).
-2. **Skeleton modules created** — four module directories (`ingestion/`, `recall/`, `benchmarking/`, `diagnostics/`) with the module-boundary docstrings from §6 as the top-of-module comment, and one stub test per module that imports it.
-3. **`MemorySystem` protocol defined** — the five public verbs from §6, typed, with docstrings citing the relevant rules.
+2. **Skeleton modules created** — three module directories (`ingestion/`, `recall/`, `diagnostics/`) with the module-boundary docstrings from §6 as the top-of-module comment, and one stub test per module that imports it.
+3. **`MemorySystem` protocol defined** — the six public verbs from §6, typed, with docstrings citing the relevant rules.
 4. **Fingerprint discipline test** — a CI test that creates two configs differing only on one field, verifies fingerprints differ; and two configs identical in all fields, verifies fingerprints match. Fails CI otherwise.
-5. **Benchmark harness wired** — LongMemEval-s loader + judge + runner ported, with an empty `NullMemorySystem` that answers "I don't know" to everything. It must produce a scorecard (≈15–25% expected from abstention-allowed questions).
-6. **Diagnostics wired** — the failure-classification taxonomy of R15 implemented against the `NullMemorySystem` run; produces a breakdown.
+5. **External benchmark integration smoke** — the `agent-memory-benchmark` repo imports engram (editable install / path import), runs an abstaining stub implementation of `MemorySystem` against LongMemEval-s, and produces a scorecard. This lives in the benchmark repo; engram's role is to stay installable and protocol-stable.
 
-Only after 1–6 are green does implementation of actual extraction/retrieval begin. Every subsequent PR must cite the rule(s) it implements or the hypothesis (M1) it tests.
+Only after 1–5 are green does implementation of actual extraction/retrieval begin. Every subsequent PR must cite the rule(s) it implements or the hypothesis (M1) it tests.
 
 After implementation begins, the rewrite is considered a success when:
 

@@ -10,8 +10,8 @@ deterministic fingerprint.
 extraction, temporal resolution, edge construction, episode detection,
 corpus-signal derivation, ingestion fingerprinting.
 
-**Does not touch.** Query text, answer generation, benchmark orchestration, judge
-prompts, cache file layout.
+**Does not touch.** Query text, answer generation, benchmark orchestration (lives
+in the external ``agent-memory-benchmark`` repo), judge prompts, cache file layout.
 
 **Stability guarantee.** The ingestion fingerprint fully covers output state:
 identical fingerprint ⇒ identical state. Violating this guarantee is a bug
