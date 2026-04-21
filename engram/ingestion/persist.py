@@ -28,9 +28,9 @@ single-file primary contract.
 from __future__ import annotations
 
 from dataclasses import asdict, fields, is_dataclass
-from typing import Any, Final
+from typing import Any, Final, cast
 
-import msgpack  # type: ignore[import-not-found]
+import msgpack  # type: ignore[import-untyped]
 import numpy as np
 
 from engram.ingestion.graph import GraphStore
@@ -171,7 +171,7 @@ def dump_state(store: GraphStore) -> bytes:
         "nodes": nodes_payload,
         "edges": edges_payload,
     }
-    return msgpack.packb(envelope, use_bin_type=True)
+    return cast("bytes", msgpack.packb(envelope, use_bin_type=True))
 
 
 # ---------------------------------------------------------------------------

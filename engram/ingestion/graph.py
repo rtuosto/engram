@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Final, cast
 
 import networkx as nx
 
@@ -51,7 +51,7 @@ class GraphStore:
     """
 
     conversation_id: str
-    _graph: nx.MultiDiGraph = field(default_factory=nx.MultiDiGraph)
+    _graph: nx.MultiDiGraph[str] = field(default_factory=nx.MultiDiGraph)
     _frozen: bool = False
     _labels_index: dict[str, set[str]] = field(default_factory=dict)
     _layers_index: dict[str, set[str]] = field(default_factory=dict)
@@ -164,7 +164,7 @@ class GraphStore:
     def node_labels(self, node_id: str) -> frozenset[str]:
         if not self._graph.has_node(node_id):
             raise NodeNotFoundError(node_id)
-        return self._graph.nodes[node_id]["labels"]
+        return cast("frozenset[str]", self._graph.nodes[node_id]["labels"])
 
     def nodes_by_label(self, label: str) -> list[str]:
         """Sorted list of node IDs carrying ``label``."""
@@ -177,7 +177,7 @@ class GraphStore:
         parallel embedding index, not on the node)."""
         if not self._graph.has_node(node_id):
             raise NodeNotFoundError(node_id)
-        return self._graph.nodes[node_id].get("layers", frozenset())
+        return cast("frozenset[str]", self._graph.nodes[node_id].get("layers", frozenset()))
 
     def nodes_by_layer(self, layer: str) -> list[str]:
         """Sorted list of node IDs carrying ``layer``.
@@ -193,7 +193,7 @@ class GraphStore:
     def get_edge_attrs(self, src: str, dst: str, edge_type: str) -> EdgeAttrs:
         if not self._graph.has_edge(src, dst, key=edge_type):
             raise KeyError((src, dst, edge_type))
-        return self._graph.edges[src, dst, edge_type]["attrs"]
+        return cast("EdgeAttrs", self._graph.edges[src, dst, edge_type]["attrs"])
 
     def out_edges(
         self, node_id: str, edge_type: str | None = None

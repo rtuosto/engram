@@ -16,6 +16,7 @@ not resolved in Tier 1 (coreference is a deferred upgrade per
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 from engram.ingestion.extractors.ner import EntityMention
 from engram.ingestion.schema import (
@@ -75,20 +76,20 @@ def _resolve_span(
 def _find_nsubj(verb: object) -> object | None:
     for child in getattr(verb, "children", ()):
         if getattr(child, "dep_", "") in {"nsubj", "nsubjpass"}:
-            return child
+            return cast("object", child)
     return None
 
 
 def _find_object(verb: object) -> object | None:
     for child in getattr(verb, "children", ()):
         if getattr(child, "dep_", "") in {"dobj", "attr"}:
-            return child
+            return cast("object", child)
     # Fall back to prepositional object via any prep child.
     for child in getattr(verb, "children", ()):
         if getattr(child, "dep_", "") == "prep":
             for grand in getattr(child, "children", ()):
                 if getattr(grand, "dep_", "") == "pobj":
-                    return grand
+                    return cast("object", grand)
     return None
 
 
