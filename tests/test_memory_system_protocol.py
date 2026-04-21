@@ -30,14 +30,14 @@ _EXPECTED_VERBS = frozenset({
 })
 
 
-_EXPECTED_ATTRIBUTES = frozenset({"memory_system_id", "version"})
+_EXPECTED_ATTRIBUTES = frozenset({"memory_system_id", "memory_version"})
 
 
 class _FakeMemory:
     """Minimal MemorySystem implementation — no-op stubs for shape verification."""
 
     memory_system_id: str = "fake"
-    version: str = "0.0.1-test"
+    memory_version: str = "0.0.1-test"
 
     async def ingest_session(self, session: Session, conversation_id: str) -> None:
         return None

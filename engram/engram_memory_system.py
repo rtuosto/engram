@@ -9,7 +9,7 @@ ingest + save-state semantics work today.
 
 ```
 <save_path>/
-    manifest.json                       # memory_system_id, version,
+    manifest.json                       # memory_system_id, memory_version,
                                         # schema_version, ingestion_fingerprint,
                                         # list of conversation_ids
     <conversation_id>.msgpack           # one per conversation
@@ -51,7 +51,7 @@ class EngramGraphMemorySystem:
     """
 
     memory_system_id: str = MEMORY_SYSTEM_ID
-    version: str = "0.1.0"
+    memory_version: str = "0.1.0"
 
     def __init__(
         self,
@@ -102,7 +102,7 @@ class EngramGraphMemorySystem:
 
         manifest = {
             "memory_system_id": self.memory_system_id,
-            "version": self.version,
+            "memory_version": self.memory_version,
             "schema_version": SCHEMA_VERSION,
             "ingestion_fingerprint": ingestion_fingerprint,
             "conversation_ids": [cid for cid, _ in conversations_sorted],

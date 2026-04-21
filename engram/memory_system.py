@@ -36,13 +36,15 @@ class MemorySystem(Protocol):
     implementation family (``"engram_graph"``, ``"null"``, …). Cache keys
     include it so unrelated systems don't collide in shared caches.
 
-    **Versioning (``R12``).** ``version`` is a monotonically increasing string
-    that MUST be bumped when on-disk state format changes. Load paths handle
-    missing / old / future versions with a clear error, not a silent crash.
+    **Versioning (``R12``).** ``memory_version`` is a monotonically increasing
+    string that MUST be bumped when on-disk state format or retrieval/answer
+    semantics change. Load paths handle missing / old / future versions with
+    a clear error, not a silent crash. (This is distinct from
+    ``engram.__version__``, which is the Python package semver.)
     """
 
     memory_system_id: str
-    version: str
+    memory_version: str
 
     async def ingest_session(self, session: Session, conversation_id: str) -> None:
         """Append a single session to the per-conversation graph.
