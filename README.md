@@ -4,7 +4,7 @@ A graph-based memory system exposed as a tool to LLM agents. An outside agent (a
 
 Measured against LongMemEval and LOCOMO by the external [`agent-memory-benchmark`](https://github.com/rtuosto/agent-memory-benchmark) repo, which both consumes engram through the `MemorySystem` protocol and implements the answerer agent that uses engram as a tool.
 
-**Status:** ingestion Tier-1 implementation has landed; architecture pivot to engram-as-tool is in flight (see [`docs/design/ingestion.md`](docs/design/ingestion.md) §12 for the patch path). Recall design is in [`docs/design/recall.md`](docs/design/recall.md). Code lands only after each section of the manifesto is green.
+**Status:** ingestion (PR-A through PR-D) and recall (PR-E) are live; the greenfield post-pivot rewrite is functionally complete. Next steps are first full benchmark run against [`agent-memory-benchmark`](https://github.com/rtuosto/agent-memory-benchmark), weight calibration, and diagnostics. Design docs: [`docs/design/ingestion.md`](docs/design/ingestion.md), [`docs/design/recall.md`](docs/design/recall.md).
 
 ## North star
 
@@ -33,7 +33,8 @@ Benchmarking — dataset loading, judging, scoring, cache layout, replicate orch
 ```python
 async def ingest(memory: Memory) -> None
 async def recall(query: str, *, now: str | None = None, timezone: str | None = None,
-                 max_passages: int | None = None) -> RecallResult
+                 max_passages: int | None = None,
+                 intent_hint: str | None = None) -> RecallResult
 ```
 
 Plus `reset`, `save_state`, `load_state`. No conversation IDs, no session IDs — one engram instance holds one memory; isolation is the caller's responsibility via `reset` or separate instances.
@@ -57,11 +58,18 @@ This repo uses the agent-bootstrap contract (see [`CLAUDE.md`](CLAUDE.md)):
 
 ## Local development
 
-To be wired once the recall implementation lands. Will require:
+Requires:
 
 - Python 3.11+
 - spaCy `en_core_web_sm` model: `python -m spacy download en_core_web_sm`
 - sentence-transformers (downloads `all-MiniLM-L6-v2` and `all-mpnet-base-v2` on first use; cached to `~/.cache/huggingface/`)
+
+Install + run the test suite:
+
+```bash
+pip install -e .
+python -m pytest tests/ -q
+```
 
 The benchmark agent's answerer (Ollama with `llama3.1:8b`) lives in the benchmark repo, not here.
 

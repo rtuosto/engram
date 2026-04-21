@@ -1,0 +1,17 @@
+{
+  "_comment": "Provisional weights awaiting calibration (docs/design/recall.md §15). Per-intent granularity seeding weights + edge-type walk weights. Tuner PR owned by engram.diagnostics will replace these.",
+  "granularity": {
+    "single_fact":       {"turn": 0.6, "sentence": 1.0, "ngram": 0.9},
+    "aggregation":       {"turn": 1.0, "sentence": 0.7, "ngram": 0.5},
+    "preference":        {"turn": 0.5, "sentence": 0.9, "ngram": 1.0},
+    "temporal":          {"turn": 1.0, "sentence": 0.9, "ngram": 0.4},
+    "entity_resolution": {"turn": 0.4, "sentence": 0.7, "ngram": 1.0}
+  },
+  "edges": {
+    "single_fact":       {"part_of": 0.8, "mentions": 0.9, "asserts": 1.0, "about": 0.9, "holds_preference": 0.6, "temporal_at": 0.4},
+    "aggregation":       {"part_of": 0.9, "mentions": 1.0, "asserts": 0.6, "about": 0.8, "holds_preference": 0.4, "temporal_at": 0.5},
+    "preference":        {"part_of": 0.7, "mentions": 0.7, "asserts": 0.6, "about": 1.0, "holds_preference": 1.0, "temporal_at": 0.3},
+    "temporal":          {"part_of": 0.8, "mentions": 0.7, "asserts": 0.8, "about": 0.5, "holds_preference": 0.3, "temporal_at": 1.0},
+    "entity_resolution": {"part_of": 0.5, "mentions": 1.0, "asserts": 0.5, "about": 0.7, "holds_preference": 0.3, "temporal_at": 0.3}
+  }
+}

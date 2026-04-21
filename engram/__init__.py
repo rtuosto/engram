@@ -23,11 +23,13 @@ from engram.models import (
     Session,
     Turn,
 )
+from engram.recall.context import RecallContext
 
 __all__ = [
     "EngramGraphMemorySystem",
     "Memory",
     "MemorySystem",
+    "RecallContext",
     "RecallFact",
     "RecallPassage",
     "RecallResult",

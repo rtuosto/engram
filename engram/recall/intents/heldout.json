@@ -1,0 +1,42 @@
+{
+  "single_fact": [
+    "What did my manager tell me about the new policy?",
+    "What was the error message on the build?",
+    "What did Dave say when he called last night?",
+    "What was the name of that movie we watched?",
+    "What did the coach suggest for practice?",
+    "What did my landlord say about the lease?"
+  ],
+  "aggregation": [
+    "How many emails did I send to Alice?",
+    "What are all the cities my family has visited?",
+    "How often has the deployment failed this quarter?",
+    "How many topics did we cover in the retrospective?",
+    "What are everyone's preferred meeting times?",
+    "Count the number of times I mentioned coffee"
+  ],
+  "preference": [
+    "Do I dislike early morning calls?",
+    "Does Alice want to attend the gala?",
+    "What kind of exercise does Bob like?",
+    "Do I prefer dark mode or light mode?",
+    "Does my partner hate horror movies?",
+    "What cuisine does the team favor for lunch?"
+  ],
+  "temporal": [
+    "When did Alice first mention the migration?",
+    "What did we talk about during Tuesday's standup?",
+    "How long ago did the outage happen?",
+    "When did Bob start using the new laptop?",
+    "What was my schedule from last Wednesday?",
+    "When did my subscription start?"
+  ],
+  "entity_resolution": [
+    "Who is the head of marketing?",
+    "What is Alice's new phone number?",
+    "Where does Carol work these days?",
+    "Who is the new tenant in the apartment above?",
+    "What is the name of my dentist?",
+    "Where is the vacation rental located?"
+  ]
+}

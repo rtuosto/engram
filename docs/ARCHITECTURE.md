@@ -73,7 +73,7 @@ Measurement against **LongMemEval-s** (primary) and **LOCOMO** (validation) live
 
 1. **Ingest.** The agent calls `MemorySystem.ingest(memory)`. Engram segments the Memory's content into granules (Turn → Sentences → N-grams), runs NER, canonicalizes entities, extracts claims and preferences, embeds each granule, and anchors timestamps. All primary data is append-only.
 2. **Derive (lazy).** Before the next recall, engram rebuilds derived indexes from primary if they're stale: co-occurrence counts, alias sets, current-truth indexes per (holder, target), change-event nodes when current truth flips, episodic clusters. Rebuilds are idempotent.
-3. **Recall.** The agent calls `MemorySystem.recall(query, *, now, timezone, max_results)`. Engram classifies intent, seeds via vector-index nearest-neighbor on granule embeddings, expands via typed-edge BFS with intent-specific weights, scores the resulting subgraph, and returns a structured `RecallResult` (ranked passages + supporting edges + provenance).
+3. **Recall.** The agent calls `MemorySystem.recall(query, *, now, timezone, max_passages, intent_hint)`. Engram classifies intent via prototype-centroid matching over hand-authored seed queries, seeds via vector-index nearest-neighbor on granule embeddings (weighted per intent) + entity-anchored seeds from query NER, expands via typed-edge BFS with intent-specific edge weights, scores the resulting subgraph per granule, and returns a structured `RecallResult` (ranked passages + supporting edges + provenance + intent-shaped facts from the derived indexes).
 4. **Agent answers.** The benchmark's agent serializes `RecallResult` into its tool-call response, may issue more recall calls, and eventually produces an answer with one `llama3.1:8b` call. The judge scores the answer.
 5. **Diagnose.** `diagnostics.classify_failures(...)` consumes `(AnswerResult, gold_annotations)` from the benchmark plus engram's graph internals and produces an enum classification (`extraction_miss | graph_gap | retrieval_miss | partial_retrieval | output_miss | agent_miss`).
 
@@ -110,13 +110,18 @@ Dataset access (LongMemEval-s, LOCOMO) is owned by the external `agent-memory-be
 
 ## Status & Next Steps
 
-**Current state.** Ingestion is complete through PR-D (patches 1–7 of `docs/design/ingestion.md §12`): post-pivot `MemorySystem` protocol (`ingest` / `recall` / `reset` / `save_state` / `load_state`), R16 primary-data discipline, n-gram granularity + layer labels, granule embeddings + parallel vector index, TimeAnchor nodes + `temporal_at` edges, and the derived-rebuild orchestrator (aliases, co-occurrence, reinforcement, current-preference, TimeAnchor chain). `recall()` raises `NotImplementedError` — the implementation lands in PR-E.
+**Current state.** Ingestion and recall are both live — the greenfield post-pivot rewrite is functionally complete:
+
+- **Ingestion** (PR-A through PR-D, `docs/design/ingestion.md §12` patches 1–7): post-pivot `MemorySystem` protocol, R16 primary-data discipline, n-gram granularity + layer labels, granule embeddings + parallel vector index, TimeAnchor nodes + `temporal_at` edges, derived-rebuild orchestrator (aliases, co-occurrence, reinforcement, current-preference, TimeAnchor chain).
+- **Recall** (PR-E, `docs/design/recall.md`): five-stage pipeline in `engram/recall/` (intent → seed → expand → score → assemble). Prototype-centroid intent classifier (R6) with fingerprint-tracked seed + held-out fixtures; semantic + entity-anchored seeding; bounded typed-edge BFS; per-granule selection; `RecallResult` with intent-shaped facts (`current_preference` / `reinforcement` / `co_occurrence`) pulled from the derived indexes. Zero LLM calls (R5, R13).
+- **Config partition.** `_INGESTION_FIELDS` + `_RECALL_FIELDS` partition the `MemoryConfig` dataclass; `recall_fingerprint` transitively includes `ingestion_fingerprint` (R4).
 
 **Where design attention goes next.**
 
-1. **Recall implementation** — `docs/design/recall.md` is locked; the greenfield `engram/recall/` module (intent classifier, seeding, expansion, scoring, assembly) is next.
-2. **Diagnostics design** — R15 classifier over `(RecallResult, gold_annotations)`, oracle subgraph computation, `needle_recall@k` / `granule_density` / `completeness` metrics, extraction-coverage reports, K7 fingerprint audits.
-3. **Follow-ups** — ChangeEvent + EpisodicNode derived indexes; co-occurrence windows beyond per-Memory; calibration of provisional thresholds (`ngram_min_tokens`, `canonicalization_match_threshold`, `preference_discrimination_margin`).
+1. **First full benchmark run** against `agent-memory-benchmark` to baseline the new architecture against the predecessor's 76% on LongMemEval-s 100q.
+2. **Weight calibration** — hand-picked seeding + edge weights in `engram/recall/weights.json` get replaced by a Diagnostics-owned tuner against `needle_recall@k` once the benchmark exists (design §15).
+3. **Diagnostics design** — R15 classifier over `(RecallResult, gold_annotations)`, oracle subgraph computation, `needle_recall@k` / `granule_density` / `completeness` metrics, extraction-coverage reports, K7 fingerprint audits.
+4. **Follow-ups.** Per-intent fails-closed gate mirroring the ingestion preference polarity gate; ChangeEvent + EpisodicNode derived indexes; co-occurrence windows `(1 hour, 1 day, all-time)`; locality-preservation context (R11) in recall; calibration of provisional thresholds (`ngram_min_tokens`, `canonicalization_match_threshold`, `preference_discrimination_margin`, `intent_discrimination_margin`).
 
 Every design-phase PR cites the rule(s) it implements or the M1 hypothesis (target bucket, expected pp gain, mechanism, validation threshold, falsification condition) it tests.
 

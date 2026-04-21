@@ -3,11 +3,12 @@
 ``P6`` — every artifact has a fingerprint; no fingerprint, no cache.
 ``R3`` — ``ingestion_fingerprint`` includes every config field that affects
 node / edge production; a config diff without a fingerprint diff is a bug.
-``R4`` — ``answer_fingerprint`` transitively includes ``ingestion_fingerprint``;
-any ingest change invalidates every downstream answer.
+``R4`` — ``recall_fingerprint`` transitively includes
+``ingestion_fingerprint``; any ingest change invalidates every downstream
+recall result.
 
 **Discipline.** Every declared field must belong to exactly one of
-:attr:`MemoryConfig._INGESTION_FIELDS` or :attr:`MemoryConfig._ANSWER_FIELDS`.
+:attr:`MemoryConfig._INGESTION_FIELDS` or :attr:`MemoryConfig._RECALL_FIELDS`.
 A field without a category is a bug caught by the class invariant check in
 ``__post_init__`` — and redundantly by ``test_fingerprint_discipline.py``, which
 fails CI.
@@ -15,9 +16,11 @@ fails CI.
 The partition:
 
 - **Ingestion fields** affect graph production. Changing one invalidates the
-  ingested graph and (by ``R4``) every cached answer.
-- **Answer fields** affect the answer but not the graph. Changing one
-  invalidates cached answers; ingested graphs remain valid.
+  ingested graph and (by ``R4``) every cached recall result.
+- **Recall fields** affect recall output but not the graph. Changing one
+  invalidates cached recall results; ingested graphs remain valid. The
+  answerer (model / temperature) no longer lives here — it belongs to the
+  external benchmark harness (``docs/design/recall.md §11``).
 
 Cache layout / log verbosity / other non-semantic knobs go in a separate
 ``RuntimeOptions`` object (not here). If you find yourself reaching for a
@@ -33,6 +36,8 @@ from dataclasses import asdict, dataclass, fields
 from typing import ClassVar
 
 from engram.ingestion.preferences import SEED_HASH as _PREFERENCE_SEED_HASH
+from engram.recall.intents import INTENT_SEED_HASH as _INTENT_SEED_HASH
+from engram.recall.weights import WEIGHTS_HASH as _RECALL_WEIGHTS_HASH
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,11 +60,20 @@ class MemoryConfig:
     # a smaller temporal layer.
     time_anchor_resolution: str = "second"
 
-    # --- Answer fields ----------------------------------------------------
-    answerer_model: str = "ollama:llama3.1:8b"
-    answerer_temperature: float = 0.0
-    recall_top_k: int = 10
-    context_char_budget: int = 16000
+    # --- Recall fields ----------------------------------------------------
+    # Fingerprint-tracked content hashes over hand-authored fixture files
+    # (seeds.json, weights.json). Editing a fixture invalidates
+    # recall_fingerprint transitively.
+    intent_seed_hash: str = _INTENT_SEED_HASH
+    recall_weights_hash: str = _RECALL_WEIGHTS_HASH
+    intent_discrimination_margin: float = 0.05
+    recall_max_depth: int = 3
+    recall_max_frontier: int = 256
+    recall_max_passages: int = 16
+    recall_seed_count_total: int = 64
+    # Per-granularity seed budget before the intent weight profile is applied.
+    # Single int rather than a table — §5 granularity weights scale this.
+    recall_top_n_per_granularity: int = 12
 
     # --- Partition (must cover every field declared above) ---------------
     _INGESTION_FIELDS: ClassVar[frozenset[str]] = frozenset({
@@ -74,30 +88,34 @@ class MemoryConfig:
         "random_seed",
         "time_anchor_resolution",
     })
-    _ANSWER_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "answerer_model",
-        "answerer_temperature",
-        "recall_top_k",
-        "context_char_budget",
+    _RECALL_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "intent_seed_hash",
+        "recall_weights_hash",
+        "intent_discrimination_margin",
+        "recall_max_depth",
+        "recall_max_frontier",
+        "recall_max_passages",
+        "recall_seed_count_total",
+        "recall_top_n_per_granularity",
     })
 
     def __post_init__(self) -> None:
         """Class invariant: every declared field is categorized exactly once."""
         declared = {f.name for f in fields(self)}
-        categorized = self._INGESTION_FIELDS | self._ANSWER_FIELDS
-        overlap = self._INGESTION_FIELDS & self._ANSWER_FIELDS
+        categorized = self._INGESTION_FIELDS | self._RECALL_FIELDS
+        overlap = self._INGESTION_FIELDS & self._RECALL_FIELDS
         missing = declared - categorized
         extra = categorized - declared
 
         if overlap:
             raise RuntimeError(
                 f"MemoryConfig partition is not disjoint — fields in both "
-                f"_INGESTION_FIELDS and _ANSWER_FIELDS: {sorted(overlap)}"
+                f"_INGESTION_FIELDS and _RECALL_FIELDS: {sorted(overlap)}"
             )
         if missing:
             raise RuntimeError(
                 f"MemoryConfig field(s) not categorized — add to "
-                f"_INGESTION_FIELDS or _ANSWER_FIELDS: {sorted(missing)} (R3)"
+                f"_INGESTION_FIELDS or _RECALL_FIELDS: {sorted(missing)} (R3)"
             )
         if extra:
             raise RuntimeError(
@@ -114,15 +132,15 @@ class MemoryConfig:
         """
         return _hash(self._extract(self._INGESTION_FIELDS))
 
-    def answer_fingerprint(self) -> str:
-        """SHA-256 of the answer-affecting fields + ingestion fingerprint (``R4``).
+    def recall_fingerprint(self) -> str:
+        """SHA-256 of the recall-affecting fields + ingestion fingerprint (``R4``).
 
         Transitivity is realized by including ``_ingestion_fingerprint`` as a
-        key in the answer payload. Any ingestion change → different ingestion
-        fingerprint → different answer fingerprint, invalidating every cached
-        answer.
+        key in the recall payload. Any ingestion change → different ingestion
+        fingerprint → different recall fingerprint, invalidating every cached
+        recall result.
         """
-        payload = self._extract(self._ANSWER_FIELDS)
+        payload = self._extract(self._RECALL_FIELDS)
         payload["_ingestion_fingerprint"] = self.ingestion_fingerprint()
         return _hash(payload)
 

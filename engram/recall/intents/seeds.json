@@ -1,0 +1,72 @@
+{
+  "single_fact": [
+    "What did Alice say about the project?",
+    "What was the last thing Bob told me?",
+    "Where did Carol mention she was traveling?",
+    "What was the name of the restaurant we tried?",
+    "What did my coworker say about the deadline?",
+    "Who did I say I was meeting on Friday?",
+    "What time is the meeting scheduled for?",
+    "What did the doctor tell me about the test results?",
+    "What was the title of the book she recommended?",
+    "Where is the keyboard I ordered coming from?",
+    "Who sent the message about the broken printer?",
+    "What did my brother say he bought yesterday?"
+  ],
+  "aggregation": [
+    "How many times have I mentioned my sister?",
+    "How often do we talk about the budget?",
+    "What does everyone think about the new office?",
+    "How many projects has Alice worked on this year?",
+    "What are my colleagues' favorite restaurants?",
+    "How many meetings did we have last month?",
+    "What are everyone's dietary restrictions?",
+    "How frequently has Bob brought up the migration?",
+    "How many trips have I taken this year?",
+    "What cities have I visited based on my notes?",
+    "Count how many books I've read recently",
+    "What are all the topics we've discussed together?"
+  ],
+  "preference": [
+    "Does Alice like pizza?",
+    "What are my dietary restrictions?",
+    "Does Bob prefer coffee or tea?",
+    "What kind of music do I enjoy?",
+    "Does Carol hate long meetings?",
+    "What foods does my friend avoid?",
+    "Do I like jazz concerts?",
+    "Does my brother want to visit Japan?",
+    "What is my favorite cuisine?",
+    "Does the team prefer asynchronous communication?",
+    "What beverages do I dislike?",
+    "Does Alice want to move to a bigger apartment?"
+  ],
+  "temporal": [
+    "When did Alice change her mind about the project?",
+    "What did we discuss yesterday?",
+    "When was the last time I spoke with Bob?",
+    "What happened before the meeting on Monday?",
+    "When did I start the new job?",
+    "How long ago did Carol mention the report?",
+    "What did I do last weekend?",
+    "When was my sister's birthday again?",
+    "What was the timeline we agreed on last week?",
+    "How many days ago did the error first appear?",
+    "What did we talk about this morning?",
+    "When did the preferences shift from coffee to tea?"
+  ],
+  "entity_resolution": [
+    "Who is the project manager on our team?",
+    "Where is Bob from originally?",
+    "What company does Alice work for?",
+    "Who is the CEO of the startup we discussed?",
+    "What is the name of Carol's dog?",
+    "Where does my brother live now?",
+    "Who is the new hire in engineering?",
+    "What is the address of the cafe we met at?",
+    "Which doctor did I mention last month?",
+    "Who is responsible for the migration project?",
+    "What is the phone number Alice shared?",
+    "Where is the conference being held?"
+  ]
+}

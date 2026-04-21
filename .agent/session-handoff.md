@@ -5,6 +5,177 @@
 
 ---
 
+## Session: 2026-04-20 — PR-E (recall implementation)
+
+### What Was Done
+
+Landed PR-E on `feat/pr-e-recall`. Greenfield `engram/recall/` per
+[`docs/design/recall.md`](../docs/design/recall.md). Engram makes zero LLM
+calls on the recall path (R5, R13).
+
+**Config (R3/R4 rename).**
+- `MemoryConfig._ANSWER_FIELDS → _RECALL_FIELDS`. `answer_fingerprint →
+  recall_fingerprint`. Removed `answerer_model` / `answerer_temperature` /
+  `context_char_budget` / `recall_top_k` (moved to the benchmark per
+  design §11).
+- New recall fields:
+  - `intent_seed_hash` (content hash of `engram/recall/intents/seeds.json`)
+  - `recall_weights_hash` (content hash of `engram/recall/weights.json`)
+  - `intent_discrimination_margin: float = 0.05` (provisional)
+  - `recall_max_depth: int = 3`
+  - `recall_max_frontier: int = 256`
+  - `recall_max_passages: int = 16`
+  - `recall_seed_count_total: int = 64`
+  - `recall_top_n_per_granularity: int = 12`
+- Fingerprint discipline test renamed along with the partition — 42 tests
+  covering the rename still pass.
+
+**Models.**
+- `RecallPassage` gained `source_memory_id`, `source_memory_index`,
+  `speaker`, `supporting_edges`. `RecallFact` reshaped to carry `kind` +
+  `value` + `supporting_memory_ids` per design §2. `RecallResult` gained
+  `intent_confidence`, `timing_ms: tuple[(stage, ms)]`, `recall_fingerprint`.
+
+**Recall module (new).**
+- `engram/recall/intents/` — hand-authored `seeds.json` + `heldout.json`
+  over five intents (`single_fact`, `aggregation`, `preference`,
+  `temporal`, `entity_resolution`). 12 seeds per intent; 6 disjoint
+  held-out queries per intent. Content hash (`INTENT_SEED_HASH`) exposed
+  to config.
+- `engram/recall/weights.json` — per-intent granularity + edge-type
+  weight table. Values provisional per design §15. Content hash
+  (`WEIGHTS_HASH`) exposed to config.
+- `engram/recall/intent.py` — `classify_intent(query, centroids, embed_fn,
+  margin_threshold, fallback)`. R6-compliant prototype-centroid classifier;
+  below-margin → fallback + raw margin returned verbatim (fails closed).
+- `engram/recall/seeding.py` — `semantic_seed` (KNN per granularity,
+  weight-scaled counts + scores), `entity_anchored_seed` (spaCy NER over
+  the query → entity + directly-mentioned granules), `merge_seeds` (max
+  per node_id + total_cap).
+- `engram/recall/expansion.py` — thin `expand()` wrapper over
+  `GraphStore.bfs(seeds, edge_weights, max_depth, max_frontier)`.
+- `engram/recall/scoring.py` — `select_passages(walk_scores, store,
+  max_passages)`; routes granule nodes to themselves, drops non-granule
+  nodes (Entity / Claim / Preference / TimeAnchor).
+- `engram/recall/assembly.py` — `build_passages` (text + granularity +
+  provenance from `part_of`-walked Memory + `temporal_at`-resolved
+  timestamp + supporting `asserts` / `holds_preference` edges),
+  `build_facts` (intent-shaped fact mix: `current_preference` for
+  preference/temporal; `reinforcement` when count>1; `co_occurrence` for
+  aggregation), `resolve_query_entity_ids`.
+- `engram/recall/context.py` — `RecallContext` frozen dataclass
+  (`now`, `timezone`, `max_passages`, `intent_hint`).
+- `engram/recall/pipeline.py` — `RecallPipeline.recall(state, query,
+  context)` orchestrates [classify → seed → expand → score → assemble].
+  Timings recorded per stage (`timing_ms`) plus a `total` entry.
+  `recall_fingerprint = sha256(config.recall_fingerprint || query ||
+  context)[:16]`. Lazy derived rebuild via fingerprint check — stale
+  snapshot triggers a fresh `rebuild_derived` before fact assembly.
+- `engram/recall/factory.py` — `build_default_recall_pipeline(config)`
+  mirrors `build_default_pipeline`; lazy-loads spaCy + sentence-transformers.
+
+**System integration.**
+- `EngramGraphMemorySystem.__init__` gains `recall_pipeline: RecallPipeline
+  | None = None` (test injection; production builds lazily on first call).
+- `EngramGraphMemorySystem.recall(...)` — no-op-then-structured-empty when
+  `state is None` (benchmark caches still get a fingerprint-shaped
+  envelope); otherwise dispatches to `RecallPipeline`.
+- `EngramGraphMemorySystem._get_recall_pipeline()` — lazy builder.
+
+**Public re-exports.** `engram.RecallContext` added to the package surface.
+
+**Tests.** Three new files (40 tests).
+- `tests/test_recall_intent.py` (11) — seed/heldout schema, centroid
+  normalization, verdict shape, custom fallback, invalid fallback
+  rejection, median margin per intent, seed/heldout disjointness,
+  content-hash stability, classification determinism.
+- `tests/test_recall_stages.py` (11) — `semantic_seed` per-granularity
+  weighting, zero-weight skip, empty index; `entity_anchored_seed`
+  resolves mentions and drops unresolved; `merge_seeds` keeps max +
+  caps; `expand` respects `max_depth`; `select_passages` buckets per
+  granule, drops non-granule nodes, respects `max_passages`, empty input.
+- `tests/test_recall_pipeline.py` (17) — empty-state recall, passage
+  retrieval + provenance fields, intent-hint bypass, invalid hint
+  rejection, recall fingerprint stability/variation under query/context,
+  determinism R2 audit (byte-identical modulo timing), `max_passages`
+  override, preference-intent fact surfacing, `single_fact` omits
+  co-occurrence, timing_ms stage names, zero-LLM-calls sentinel,
+  save/load roundtrip preserves recall, timezone invalidation.
+
+Test suite: 225 passing (was 178 on PR-D); ruff clean; mypy 16 pre-existing
+errors (unchanged).
+
+### Current State
+
+- Branch: `feat/pr-e-recall` (open; not yet PR'd against main)
+- `main` at `bf3460a` — PR-D merged
+- Tests: 225 passing, ruff clean, mypy 16 pre-existing errors
+- Build: `pip install -e .` unchanged
+- `SCHEMA_VERSION = 3`, `memory_version = 0.4.0` (unchanged — recall is
+  pure runtime; no on-disk format changes).
+
+### What's Next
+
+**Immediate:** open PR-E → main → merge.
+
+After PR-E lands, the rewrite roadmap is complete:
+
+1. ~~**PR-B** — n-gram granularity + layer labels.~~
+2. ~~**PR-C** — granule embeddings + parallel vector index.~~
+3. ~~**PR-D** — TimeAnchor + derived-rebuild orchestrator.~~
+4. ~~**PR-E** — recall implementation (greenfield `engram/recall/`).~~ (this session)
+
+Natural follow-ups (each its own PR, each grounded in a measured hypothesis):
+
+- Per-intent weight calibration via Diagnostics-owned tuner (design §15).
+- Co-occurrence windowing `(1 hour, 1 day, all-time)` (PR-D follow-up).
+- ChangeEvent + EpisodicNode emission (manifesto §7 D5, D6).
+- First full benchmark run against `agent-memory-benchmark` to baseline
+  the new architecture vs the predecessor's 76%.
+
+### Open Questions
+
+- Intent classifier runs on the deterministic-embed fake in tests — real
+  centroid discrimination on MiniLM is validated by
+  `median_intent_margin`, which the factory currently does not gate on.
+  A per-intent fails-closed policy (mirroring preference polarities)
+  is a natural follow-up once benchmark data exists.
+- N-gram passages use `NgramPayload.surface_form` as their passage text
+  (short — can be <20 chars). The design §14 flags including the parent
+  Sentence's text with the n-gram highlighted; deferred until post-
+  benchmark measurement tells us whether agents benefit.
+- `locality preservation` (R11 context around a Sentence passage) is
+  **not** implemented — design §8 describes it but recall v1 ships
+  without it; added as an item once a concrete gain-hypothesis exists.
+- `max_frontier` eviction in `GraphStore.bfs` truncates the frontier but
+  not the accumulated score map. If a pathological graph pushes scores
+  that later get surfaced as passages despite being frontier-evicted
+  mid-walk, recall surfaces them anyway. Not an issue at benchmark
+  scale; flagging for the scaling triggers doc.
+
+### Gotchas
+
+- The recall pipeline's `timing_ms` is wall-clock — byte-identity of
+  `RecallResult` across two runs requires zeroing or stripping the
+  `timing_ms` field (the R2 audit test does this via
+  `dataclasses.replace(r, timing_ms=())`). Any future test that compares
+  two RecallResults end-to-end must follow the same convention.
+- `EngramGraphMemorySystem.recall()` on an un-ingested system returns an
+  empty `RecallResult(passages=(), intent=None)` rather than raising.
+  This preserves benchmark-cache key construction but **does not** set
+  `recall_fingerprint` — callers expecting a fingerprint must gate on
+  `state is not None` before relying on it.
+- `engram/recall/__init__.py` is kept empty of re-exports (just the
+  module docstring) to avoid circular imports via `engram.config →
+  engram.recall.intents`. Import the runtime classes from their explicit
+  submodules (`engram.recall.pipeline`, `engram.recall.context`).
+- Seeds / weights files are fingerprint-tracked: editing them shifts
+  `intent_seed_hash` / `recall_weights_hash` → `recall_fingerprint`
+  changes → every cached recall result invalidates. This is intentional
+  (R4). Be deliberate about edits.
+
+---
+
 ## Session: 2026-04-20 — PR-D (TimeAnchor + derived-rebuild orchestrator)
 
 ### What Was Done
