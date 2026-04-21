@@ -5,6 +5,86 @@
 
 ---
 
+## Session: 2026-04-21 (2) — ingestion-perf Phase 5
+
+### What Was Done
+
+Landed `perf/ingest-many` — `MemorySystem.ingest_many(memories)` batched
+variant. Structural R3/R4 equivalence verified with both the fake
+embedder (byte-identical msgpack) and real transformers (structural
+fingerprint `OK nodes=271 edges=539` on the 20-memory synthetic subset).
+
+- **Protocol extension** ([engram/memory_system.py](../engram/memory_system.py)):
+  added `async def ingest_many(self, memories: Iterable[Memory])` with a
+  concrete default body that loops `await self.ingest(m)`. Any
+  implementation may override with a batched variant that pools model
+  calls across the batch — the contract is "same graph as sequential,
+  within the structural fingerprint guard's 1e-5 weight tolerance."
+- **EngramGraphMemorySystem override** ([engram/engram_memory_system.py](../engram/engram_memory_system.py))
+  → delegates to `IngestionPipeline.ingest_many(state, memory_seq)`.
+- **Pipeline batched path** ([engram/ingestion/pipeline.py](../engram/ingestion/pipeline.py)):
+  split `_extract_claims_and_preferences` into `_emit_claims_collect_prefs`
+  (pass 1) + `_emit_prefs_from_verdicts` (pass 2). New
+  `IngestionPipeline.ingest_many` method:
+  - one `nlp_process([all_memory_contents])` call (spaCy pipe batching)
+  - one `granule_embed(all_granule_texts)` call (MiniLM batch)
+  - one `classify_batch(all_sentence_texts, ...)` call (mpnet batch)
+  - per-memory graph writes, canonicalization, speaker caching, and
+    TimeAnchor emission stay sequential so R16 append-only ordering is
+    preserved exactly.
+- **Protocol-shape test** ([tests/test_memory_system_protocol.py](../tests/test_memory_system_protocol.py))
+  — added `ingest_many` to `_EXPECTED_VERBS` and to the `_FakeMemory`
+  witness (default loop impl). All six verbs now tested for async +
+  docstring citation.
+- **New equivalence test** ([tests/test_ingest_many_equivalence.py](../tests/test_ingest_many_equivalence.py))
+  — four assertions on the batched path: byte-identical msgpack vs
+  sequential under the composition-invariant fake embedder,
+  empty-is-noop, single-memory batch matches single ingest, vector-index
+  row equality.
+- **Profile harness extension** ([scripts/profile_ingestion.py](../scripts/profile_ingestion.py))
+  — new `--batch-size` flag. `--batch-size 0` (default) uses sequential
+  ingest (Phase 1/2 shape); `> 0` drives `ingest_many` in chunks and
+  tags the artifact with `corpus=synthetic+batchN`.
+
+### Measured deltas (50-memory synthetic corpus, single run)
+
+| Driver                 | total_s | mean_ms | nlp | pref | granule |
+| ---------------------- | ------- | ------- | --- | ---- | ------- |
+| sequential (Phase 2)   | 1.003   | 20.07   | 50  | 37   | 50      |
+| `ingest_many`, size=10 | 0.453   | 9.06    | 5   | 5    | 5       |
+| `ingest_many`, size=50 | 0.388   | 7.77    | 1   | 1    | 1       |
+
+**2.58× end-to-end speedup** at batch-size 50. Graph totals identical
+across all three runs (50 memories, 39 entities, 9 claims, 5
+preferences, 489 granules, 1296 edges). Preference-embed time dropped
+322ms → 17.7ms (−94%). Artifacts: `profiling/phase5-seq.json`,
+`profiling/phase5-batch10.json`, `profiling/phase5-batch50.json`.
+
+### Current State
+
+- Branch: `perf/ingest-many`
+- Tests: 265 passing (added 5 new in `test_ingest_many_equivalence.py`
+  and the `ingest_many`-parametrized protocol-shape tests on top of the
+  prior 258).
+- Build: clean.
+
+### Gotchas
+
+- The Protocol default for `ingest_many` is a concrete loop — if you add
+  a new `MemorySystem` implementation, you only need to implement
+  `ingest` to be structurally compatible, but for
+  `isinstance(x, MemorySystem)` (`runtime_checkable`) to pass you still
+  need the attribute. The `_FakeMemory` witness shows the minimum shape.
+- R3/R4 guard remains structural (same graph topology + 1e-5 weight
+  tolerance), NOT bytes — batched mpnet drifts at the 7th–8th decimal
+  exactly like Phase 2. `scripts/check_fingerprint_equivalence.py`
+  already handles this; don't revert to byte-hash comparison.
+- Model-load cost (`~10s` for spaCy + MiniLM + mpnet + centroid probes)
+  is still amortized-once-per-process. Phase 6 (module-scope cache
+  keyed on the full ingestion fingerprint) remains unimplemented.
+
+---
+
 ## Session: 2026-04-21 — ingestion-perf Phase 1 + Phase 2
 
 ### What Was Done

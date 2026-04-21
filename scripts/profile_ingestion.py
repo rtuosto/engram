@@ -260,6 +260,27 @@ async def _ingest_all(
         per_ingest_ms.append((time.perf_counter() - t0) * 1000.0)
 
 
+async def _ingest_all_batched(
+    system: EngramGraphMemorySystem,
+    memories: list[Memory],
+    per_ingest_ms: list[float],
+    batch_size: int,
+) -> None:
+    """Drive :meth:`EngramGraphMemorySystem.ingest_many` in fixed-size batches.
+
+    ``per_ingest_ms`` is populated with the *per-batch* wall-clock divided
+    across the batch's memories so the p50/p95 numbers stay comparable to
+    the sequential run (the summary stats assume one entry per Memory).
+    """
+    for start in range(0, len(memories), batch_size):
+        chunk = memories[start : start + batch_size]
+        t0 = time.perf_counter()
+        await system.ingest_many(chunk)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        per_item_ms = elapsed_ms / max(1, len(chunk))
+        per_ingest_ms.extend([per_item_ms] * len(chunk))
+
+
 def _git_commit() -> str:
     try:
         out = subprocess.check_output(
@@ -286,6 +307,7 @@ def run_profile(
     corpus: str,
     enable_cprofile: bool,
     out_path: Path | None,
+    batch_size: int = 0,
 ) -> ProfileRun:
     if corpus == "longmemeval":
         mems = _longmemeval_corpus(n_memories)
@@ -312,7 +334,10 @@ def run_profile(
         profiler.enable()
 
     t0 = time.perf_counter()
-    asyncio.run(_ingest_all(system, mems, per_ingest_ms))
+    if batch_size > 0:
+        asyncio.run(_ingest_all_batched(system, mems, per_ingest_ms, batch_size))
+    else:
+        asyncio.run(_ingest_all(system, mems, per_ingest_ms))
     total_s = time.perf_counter() - t0
 
     if profiler is not None:
@@ -328,6 +353,11 @@ def run_profile(
         stage_meters=stage_meters,
         graph_totals=_graph_totals(system),
     )
+    if batch_size > 0:
+        # Record the driver mode inside the artifact so before/after diffs
+        # are self-identifying (the Phase 5 delta lives in the batched
+        # artifact; the Phase 1/2 baselines live in the sequential one).
+        run.corpus = f"{corpus}+batch{batch_size}"
 
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,18 +421,30 @@ def main() -> None:
         action="store_true",
         help="Also dump a .prof sample next to the JSON artifact.",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, drive ingestion via ``ingest_many`` in chunks of this "
+            "size (Phase 5 batched path). Default 0 uses sequential "
+            "``ingest`` — same as Phase 1/2 baselines."
+        ),
+    )
     args = parser.parse_args()
 
     out_path = args.out
     if out_path is None:
         commit = _git_commit()
-        out_path = PROFILING_DIR / f"ingestion-{commit}.json"
+        suffix = f"-batch{args.batch_size}" if args.batch_size > 0 else ""
+        out_path = PROFILING_DIR / f"ingestion-{commit}{suffix}.json"
 
     run = run_profile(
         n_memories=args.n_memories,
         corpus=args.corpus,
         enable_cprofile=args.cprofile,
         out_path=out_path,
+        batch_size=args.batch_size,
     )
     _print_summary(run)
     print(f"\n[profile] artifact: {out_path}")

@@ -32,12 +32,13 @@ Benchmarking — dataset loading, judging, scoring, cache layout, replicate orch
 
 ```python
 async def ingest(memory: Memory) -> None
+async def ingest_many(memories: Iterable[Memory]) -> None  # batched variant
 async def recall(query: str, *, now: str | None = None, timezone: str | None = None,
                  max_passages: int | None = None,
                  intent_hint: str | None = None) -> RecallResult
 ```
 
-Plus `reset`, `save_state`, `load_state`. No conversation IDs, no session IDs — one engram instance holds one memory; isolation is the caller's responsibility via `reset` or separate instances.
+Plus `reset`, `save_state`, `load_state`. `ingest_many` is semantically equivalent to looping `ingest`; `EngramGraphMemorySystem` overrides it to pool spaCy / mpnet / MiniLM forward passes across the batch dimension (≈2.6× faster on 50-memory synthetic workloads; R3/R4 structural equivalence with sequential). No conversation IDs, no session IDs — one engram instance holds one memory; isolation is the caller's responsibility via `reset` or separate instances.
 
 ## Design contract
 
@@ -74,7 +75,11 @@ python -m pytest tests/ -q
 Profile ingestion end-to-end (per-stage wall-clock, JSON artifact under `profiling/`):
 
 ```bash
+# Sequential path (Phase 1/2 baseline shape):
 python scripts/profile_ingestion.py --n-memories 40
+
+# Phase 5 batched path (one batched nlp/granule/preference call per chunk):
+python scripts/profile_ingestion.py --n-memories 50 --batch-size 50
 ```
 
 The benchmark agent's answerer (Ollama with `llama3.1:8b`) lives in the benchmark repo, not here.

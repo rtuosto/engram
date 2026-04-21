@@ -28,6 +28,7 @@ id, and every declared sidecar decodes cleanly. No implicit migration.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Final
 
@@ -94,6 +95,25 @@ class EngramGraphMemorySystem:
         if self._state is None:
             self._state = pipeline.create_state()
         pipeline.ingest(self._state, memory)
+
+    async def ingest_many(self, memories: Iterable[Memory]) -> None:
+        """Batched variant of :meth:`ingest`.
+
+        Collapses the three model calls (spaCy ``nlp.pipe``, granule
+        embedding, preference embedding) across the batch dimension while
+        keeping per-Memory graph writes in order. Structural output is
+        identical to looping :meth:`ingest`; edge-weight / vector-row
+        numerics may drift at ~5e-8 due to batch-composition changes in
+        transformer inference (guard:
+        ``scripts/check_fingerprint_equivalence.py``, R3/R4).
+        """
+        memory_seq: tuple[Memory, ...] = tuple(memories)
+        if not memory_seq:
+            return
+        pipeline = self._get_pipeline()
+        if self._state is None:
+            self._state = pipeline.create_state()
+        pipeline.ingest_many(self._state, memory_seq)
 
     async def recall(
         self,

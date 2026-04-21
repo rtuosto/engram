@@ -14,6 +14,7 @@ of what a valid implementation looks like.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from engram import Memory, MemorySystem, RecallResult
 
 _EXPECTED_VERBS = frozenset({
     "ingest",
+    "ingest_many",
     "recall",
     "reset",
     "save_state",
@@ -40,6 +42,10 @@ class _FakeMemory:
 
     async def ingest(self, memory: Memory) -> None:
         return None
+
+    async def ingest_many(self, memories: Iterable[Memory]) -> None:
+        for memory in memories:
+            await self.ingest(memory)
 
     async def recall(
         self,

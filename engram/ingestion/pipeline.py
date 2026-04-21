@@ -35,7 +35,7 @@ lands in PR-D.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -157,6 +157,26 @@ class _MemoryWork:
     entity_id_by_span: dict[tuple[int, int], str]
     speaker_entity_id: str
     segments: tuple[_SegmentInfo, ...]
+
+
+@dataclass(slots=True)
+class _BatchBucket:
+    """Mutable per-Memory bucket used by :meth:`IngestionPipeline.ingest_many`.
+
+    Collects the structural output of stages 1–6 for one Memory while the
+    batched model calls (stage 2 spaCy, stage 7 preference classification,
+    stage 8 granule embedding) run once across the whole batch. ``work`` is
+    ``None`` when spaCy produced no parsed doc for that Memory — the Turn
+    granule still exists but no downstream claim / preference / n-gram /
+    segment work happens for it (same fails-closed path as the sequential
+    ``ingest`` with empty ``nlp_process`` output).
+    """
+
+    memory: Memory
+    memory_id: str
+    turn_id: str
+    work: _MemoryWork | None
+    anchor_sources: list[str]
 
 
 class IngestionPipeline:
@@ -284,6 +304,181 @@ class IngestionPipeline:
         self._emit_time_anchor(
             state, memory, anchor_sources=anchor_sources, memory_id=memory_id
         )
+
+    def ingest_many(
+        self, state: InstanceState, memories: Sequence[Memory]
+    ) -> None:
+        """Batched ingest across a sequence of Memories.
+
+        Pipeline semantics match :meth:`ingest` per Memory — same nodes,
+        same edges, same canonicalization state flow, same Memory-index
+        sequence. The speedup comes from collapsing the three model calls
+        across the batch dimension:
+
+        * stage [2] — one ``nlp_process([all_memory_contents])`` call
+          (spaCy's native pipe batching, instead of N single-doc calls).
+        * stage [8] — one ``granule_embed(all_granule_texts)`` call over
+          every Turn / Sentence / N-gram emitted across all Memories.
+        * stage [7] — one ``preference_embed(all_sentence_texts)`` call
+          over every Claim-bearing sentence across all Memories.
+
+        Structural graph output (nodes / edge tuples / payloads) is
+        byte-identical to ``[ingest(m) for m in memories]``. Edge
+        ``weight`` on ``holds_preference`` and the float32 rows in
+        :class:`VectorIndex` may drift at ~5e-8 because batch composition
+        changes the numerics of batched transformer inference — this is
+        covered by the structural-fingerprint guard at ``scripts/
+        check_fingerprint_equivalence.py`` (R3/R4).
+
+        **Append-only ordering (R16).** Memories are processed in the
+        given order; ``state.memory_index`` advances monotonically; graph
+        writes happen per-Memory in the same order the sequential path
+        would make them. The batched model calls only pool the inputs —
+        they never re-order observations.
+        """
+        if state.store.frozen:
+            from engram.ingestion.graph import GraphFrozenError
+
+            raise GraphFrozenError("cannot ingest into frozen engram instance")
+        if not memories:
+            return
+
+        # Stage [2]: one spaCy call for the whole batch. Fall back to an
+        # empty doc list if ``nlp_process`` mis-sizes its return (defensive;
+        # real factory-wired callables always return one doc per input).
+        texts = [m.content for m in memories]
+        docs = self._nlp_process(texts)
+
+        # Cross-Memory accumulators. Granules are appended in per-Memory
+        # emission order (same order the sequential ingest would use) so
+        # the vector index row ordering stays R2-stable.
+        global_granule_batch: list[tuple[str, str, str]] = []
+        global_pref_texts: list[str] = []
+        # (bucket_index, claim_payload, asserted_at) per pending preference
+        # entry, positionally aligned with ``global_pref_texts``.
+        global_pref_meta: list[tuple[int, ClaimPayload, str | None]] = []
+        buckets: list[_BatchBucket] = []
+
+        for mem_idx, memory in enumerate(memories):
+            # [1] Memory node + Turn granule.
+            memory_id, _ = self._emit_memory(state, memory)
+            turn_id, _ = self._emit_turn_granule(
+                state, memory_id, memory, granule_batch=global_granule_batch
+            )
+            anchor_sources: list[str] = [turn_id]
+            bucket = _BatchBucket(
+                memory=memory,
+                memory_id=memory_id,
+                turn_id=turn_id,
+                work=None,
+                anchor_sources=anchor_sources,
+            )
+            buckets.append(bucket)
+
+            doc = docs[mem_idx] if mem_idx < len(docs) else None
+            if doc is None:
+                # Same fails-closed shape as ``ingest`` with empty
+                # ``nlp_process`` output: Turn granule stays, no downstream
+                # structural work, TimeAnchor still fires at stage [9].
+                continue
+
+            # [3] Segmentation.
+            segments = self._emit_segments(
+                state,
+                turn_id,
+                doc,
+                memory_id=memory_id,
+                granule_batch=global_granule_batch,
+            )
+            anchor_sources.extend(seg.segment_id for seg in segments)
+
+            # [4] N-gram extraction.
+            ngram_ids = self._emit_ngrams(
+                state,
+                doc,
+                segments,
+                memory_id=memory_id,
+                granule_batch=global_granule_batch,
+            )
+            anchor_sources.extend(ngram_ids)
+
+            # [5] NER.
+            mentions = extract_mentions(doc, turn_id)
+
+            # [6] Entity canonicalization + mention edges.
+            entity_id_by_span: dict[tuple[int, int], str] = {}
+            for mention in mentions:
+                entity_id = self._canonicalize_and_link_mention(
+                    state,
+                    mention,
+                    turn_id,
+                    memory_id=memory_id,
+                    asserted_at=memory.timestamp,
+                )
+                entity_id_by_span[mention.char_span] = entity_id
+
+            speaker_label = memory.speaker or ANONYMOUS_SPEAKER
+            speaker_entity_id = self._ensure_speaker_entity(state, speaker_label)
+
+            work = _MemoryWork(
+                memory_id=memory_id,
+                turn_id=turn_id,
+                mentions=tuple(mentions),
+                entity_id_by_span=entity_id_by_span,
+                speaker_entity_id=speaker_entity_id,
+                segments=tuple(segments),
+            )
+            bucket.work = work
+
+            # [7a] Claim emission (Pass 1 of preference). Pending prefs
+            # feed the global preference batch below.
+            claim_ids, pending_prefs = self._emit_claims_collect_prefs(
+                state, work, asserted_at=memory.timestamp
+            )
+            anchor_sources.extend(claim_ids)
+            for claim_payload, sent_text in pending_prefs:
+                global_pref_texts.append(sent_text)
+                global_pref_meta.append((mem_idx, claim_payload, memory.timestamp))
+
+        # [8] Stage — one granule embedding call for the whole batch.
+        self._emit_granule_embeddings(state, global_granule_batch)
+
+        # [7b] Stage — one preference classification call for the whole
+        # batch. Verdicts align positionally with ``global_pref_meta``.
+        if global_pref_texts:
+            verdicts = classify_batch(
+                global_pref_texts,
+                self._centroids,
+                self._preference_embed,
+                margin_threshold=self._config.preference_discrimination_margin,
+                enabled_polarities=self._enabled_polarities,
+            )
+            for (bucket_idx, claim_payload, asserted_at), verdict in zip(
+                global_pref_meta, verdicts, strict=True
+            ):
+                if verdict is None:
+                    continue
+                bucket = buckets[bucket_idx]
+                if bucket.work is None:
+                    continue
+                pref_id = self._emit_preference_from_verdict(
+                    state,
+                    bucket.work,
+                    verdict=verdict,
+                    claim_payload=claim_payload,
+                    asserted_at=asserted_at,
+                )
+                bucket.anchor_sources.append(pref_id)
+
+        # [9] Stage — per-Memory TimeAnchor + ``temporal_at`` edges. Same
+        # fails-closed rule as ``ingest``: skipped when ``timestamp`` is None.
+        for bucket in buckets:
+            self._emit_time_anchor(
+                state,
+                bucket.memory,
+                anchor_sources=bucket.anchor_sources,
+                memory_id=bucket.memory_id,
+            )
 
     # ------------------------------------------------------------------
     # Internals
@@ -573,12 +768,59 @@ class IngestionPipeline:
         ingest (de-duplicated in insertion order). Used by stage [9] to
         attach ``temporal_at`` edges to freshly observed relationships.
 
-        Preference classification is batched: all claim sentences for this
-        Memory are embedded in one ``preference_embed`` call. Persisted
-        output is byte-identical to the per-claim path because
+        Preference classification is batched per-Memory: all claim sentences
+        for this Memory are embedded in one ``preference_embed`` call.
+        ``ingest_many`` further widens the batch across Memories; the split
+        between pass-1 (claim emission) and pass-2 (preference classification)
+        is factored into :meth:`_emit_claims_collect_prefs` and
+        :meth:`_emit_prefs_from_verdicts` so both paths share the per-claim
+        graph-write code.
+
+        Persisted output is byte-identical to the per-claim path because
         ``dump_state`` sorts nodes by ``node_id`` and edges by ``(src, dst,
         type)`` — insertion order of Claim and Preference nodes does not
         affect the msgpack bytes (see persist.py:151,158).
+        """
+        claim_ids, pending_prefs = self._emit_claims_collect_prefs(
+            state, work, asserted_at=asserted_at
+        )
+
+        if not pending_prefs:
+            return list(claim_ids)
+
+        verdicts = classify_batch(
+            [text for _, text in pending_prefs],
+            self._centroids,
+            self._preference_embed,
+            margin_threshold=self._config.preference_discrimination_margin,
+            enabled_polarities=self._enabled_polarities,
+        )
+        pref_ids = self._emit_prefs_from_verdicts(
+            state, work, pending_prefs, verdicts, asserted_at=asserted_at
+        )
+
+        seen: set[str] = set()
+        out: list[str] = []
+        for nid in list(claim_ids) + list(pref_ids):
+            if nid in seen:
+                continue
+            seen.add(nid)
+            out.append(nid)
+        return out
+
+    def _emit_claims_collect_prefs(
+        self,
+        state: InstanceState,
+        work: _MemoryWork,
+        *,
+        asserted_at: str | None,
+    ) -> tuple[list[str], list[tuple[ClaimPayload, str]]]:
+        """Pass 1: emit Claim nodes/edges for a single Memory and collect
+        ``(claim_payload, sentence_text)`` pairs that feed preference
+        classification. Shared by :meth:`ingest` and :meth:`ingest_many`.
+
+        The returned ``pending_prefs`` list preserves segment/claim order so
+        downstream preference emission stays R2-stable.
         """
         resolved = [
             ResolvedMention(
@@ -589,18 +831,7 @@ class IngestionPipeline:
             if (m.char_span[0], m.char_span[1]) in work.entity_id_by_span
         ]
 
-        emitted_ids: list[str] = []
-        seen: set[str] = set()
-
-        def _record(node_id_: str) -> None:
-            if node_id_ in seen:
-                return
-            seen.add(node_id_)
-            emitted_ids.append(node_id_)
-
-        # Pass 1: emit Claim nodes/edges and collect the (claim, sentence_text)
-        # pairs that feed preference classification. Sentence text is the
-        # input to mpnet — same as the unbatched path.
+        claim_ids: list[str] = []
         pending_prefs: list[tuple[ClaimPayload, str]] = []
         for seg in work.segments:
             sent = seg.sent
@@ -620,34 +851,43 @@ class IngestionPipeline:
             )
 
             for claim_id, claim_payload in claims:
-                self._emit_claim(state, work, claim_id, claim_payload, asserted_at=asserted_at)
-                _record(claim_id)
+                self._emit_claim(
+                    state, work, claim_id, claim_payload, asserted_at=asserted_at
+                )
+                claim_ids.append(claim_id)
                 pending_prefs.append((claim_payload, sent_text))
 
-        # Pass 2: one batched preference-embed call for all collected claim
-        # sentences. Verdicts align positionally with pending_prefs.
-        if pending_prefs:
-            verdicts = classify_batch(
-                [text for _, text in pending_prefs],
-                self._centroids,
-                self._preference_embed,
-                margin_threshold=self._config.preference_discrimination_margin,
-                enabled_polarities=self._enabled_polarities,
+        return claim_ids, pending_prefs
+
+    def _emit_prefs_from_verdicts(
+        self,
+        state: InstanceState,
+        work: _MemoryWork,
+        pending_prefs: Sequence[tuple[ClaimPayload, str]],
+        verdicts: Sequence[PreferenceVerdict | None],
+        *,
+        asserted_at: str | None,
+    ) -> list[str]:
+        """Pass 2: given a positionally-aligned ``(pending_prefs, verdicts)``
+        pair, emit a Preference node for each non-``None`` verdict. Used by
+        both :meth:`_extract_claims_and_preferences` (per-Memory batch) and
+        :meth:`ingest_many` (cross-Memory batch).
+        """
+        pref_ids: list[str] = []
+        for (claim_payload, _sent_text), verdict in zip(
+            pending_prefs, verdicts, strict=True
+        ):
+            if verdict is None:
+                continue
+            pref_id = self._emit_preference_from_verdict(
+                state,
+                work,
+                verdict=verdict,
+                claim_payload=claim_payload,
+                asserted_at=asserted_at,
             )
-            for (claim_payload, _sent_text), verdict in zip(
-                pending_prefs, verdicts, strict=True
-            ):
-                if verdict is None:
-                    continue
-                pref_id = self._emit_preference_from_verdict(
-                    state,
-                    work,
-                    verdict=verdict,
-                    claim_payload=claim_payload,
-                    asserted_at=asserted_at,
-                )
-                _record(pref_id)
-        return emitted_ids
+            pref_ids.append(pref_id)
+        return pref_ids
 
     def _emit_claim(
         self,
