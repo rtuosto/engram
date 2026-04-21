@@ -1,0 +1,48 @@
+{
+  "commit": "cfae8bb",
+  "corpus": "synthetic",
+  "graph_totals": {
+    "n_claims": 9,
+    "n_edges": 524,
+    "n_entities": 39,
+    "n_granules": 198,
+    "n_memories": 20,
+    "n_nodes": 267,
+    "n_preferences": 1,
+    "n_time_anchors": 20
+  },
+  "max_ingest_ms": 19.968,
+  "mean_ingest_ms": 15.824,
+  "memories": 20,
+  "model_load_s": 10.042,
+  "other_ms": 13.564,
+  "p50_ingest_ms": 16.309,
+  "p95_ingest_ms": 19.968,
+  "stages": {
+    "granule_embed": {
+      "calls": 20,
+      "items": 178,
+      "mean_ms_per_call": 5.133,
+      "mean_ms_per_item": 0.577,
+      "name": "granule_embed",
+      "total_ms": 102.668
+    },
+    "nlp_process": {
+      "calls": 20,
+      "items": 20,
+      "mean_ms_per_call": 6.802,
+      "mean_ms_per_item": 6.802,
+      "name": "nlp_process",
+      "total_ms": 136.037
+    },
+    "preference_embed": {
+      "calls": 15,
+      "items": 23,
+      "mean_ms_per_call": 4.28,
+      "mean_ms_per_item": 2.792,
+      "name": "preference_embed",
+      "total_ms": 64.205
+    }
+  },
+  "total_ingest_s": 0.316
+}

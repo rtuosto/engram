@@ -47,7 +47,7 @@ class MemoryConfig:
     # --- Ingestion fields -------------------------------------------------
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     spacy_model: str = "en_core_web_sm"
-    preference_embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
+    preference_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     preference_seed_hash: str = _PREFERENCE_SEED_HASH
     canonicalization_match_threshold: float = 0.85
     preference_discrimination_margin: float = 0.05
