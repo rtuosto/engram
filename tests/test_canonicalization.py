@@ -1,6 +1,10 @@
-"""Entity canonicalization determinism + merge semantics (§6).
+"""Entity canonicalization determinism + merge semantics (§10).
 
 R2-critical: tie-breaking must be deterministic under any insertion order.
+
+R16: :class:`EntityPayload` has no ``aliases`` field. The canonicalizer
+resolves mention surfaces to Entity node IDs; alias collection is a derived
+index (PR-D) rebuilt from inbound ``mentions`` edges.
 """
 
 from __future__ import annotations
@@ -31,20 +35,19 @@ def test_normalize_nfkc_casefold() -> None:
 
 def test_exact_match_reuses_existing_node() -> None:
     registry = EntityRegistry()
-    id_a, payload_a, new_a = canonicalize(_mention("Alice"), registry, match_threshold=0.85)
-    id_b, payload_b, new_b = canonicalize(_mention("alice"), registry, match_threshold=0.85)
+    id_a, _payload_a, new_a = canonicalize(_mention("Alice"), registry, match_threshold=0.85)
+    id_b, _payload_b, new_b = canonicalize(_mention("alice"), registry, match_threshold=0.85)
     assert new_a is True
     assert new_b is False
     assert id_a == id_b
-    assert set(payload_b.aliases) == {"Alice", "alice"}
 
 
 def test_fuzzy_match_above_threshold_merges() -> None:
     registry = EntityRegistry()
-    canonicalize(_mention("Dr. Alice Smith"), registry, match_threshold=0.7)
-    id_b, payload_b, new_b = canonicalize(_mention("Alice Smith"), registry, match_threshold=0.7)
+    id_a, _, _ = canonicalize(_mention("Dr. Alice Smith"), registry, match_threshold=0.7)
+    id_b, _, new_b = canonicalize(_mention("Alice Smith"), registry, match_threshold=0.7)
     assert new_b is False
-    assert "Alice Smith" in payload_b.aliases
+    assert id_a == id_b
 
 
 def test_type_gate_prevents_cross_type_merge() -> None:
@@ -58,7 +61,7 @@ def test_type_gate_prevents_cross_type_merge() -> None:
 def test_threshold_below_creates_new_entity() -> None:
     registry = EntityRegistry()
     canonicalize(_mention("Alice"), registry, match_threshold=0.85)
-    id_b, _, is_new = canonicalize(_mention("Bob"), registry, match_threshold=0.85)
+    _id_b, _, is_new = canonicalize(_mention("Bob"), registry, match_threshold=0.85)
     assert is_new is True
 
 
@@ -71,12 +74,12 @@ def test_determinism_per_sequence() -> None:
         _mention("Bob", span=(40, 43)),
     ]
 
-    def run() -> list[tuple[str, tuple[str, ...]]]:
+    def run() -> list[str]:
         reg = EntityRegistry()
-        out: list[tuple[str, tuple[str, ...]]] = []
+        out: list[str] = []
         for m in mentions:
-            eid, payload, _ = canonicalize(m, reg, match_threshold=0.85)
-            out.append((eid, payload.aliases))
+            eid, _payload, _ = canonicalize(m, reg, match_threshold=0.85)
+            out.append(eid)
         return out
 
     assert run() == run()
@@ -107,16 +110,14 @@ def test_insertion_order_invariant_when_no_merges() -> None:
         assert run(order) == base
 
 
-def test_aliases_sorted_deterministically() -> None:
-    """Aliases tuple is always sorted; insertion-order-invariant."""
-    reg_forward = EntityRegistry()
-    reg_reverse = EntityRegistry()
-    for surface in ["Zed", "alice", "Alice"]:
-        canonicalize(_mention(surface), reg_forward, match_threshold=0.0)
-    for surface in ["alice", "Zed", "Alice"]:
-        canonicalize(_mention(surface), reg_reverse, match_threshold=0.0)
+def test_payload_has_no_aliases_field() -> None:
+    """R16: aliases live in the derived index, not on the Entity payload."""
+    from dataclasses import fields
 
-    # With threshold=0 everything merges into the first entity of the type.
-    fw_alias = next(iter(reg_forward.by_type_and_form.values()))[1]
-    rv_alias = next(iter(reg_reverse.by_type_and_form.values()))[1]
-    assert fw_alias == rv_alias
+    from engram.ingestion.schema import EntityPayload
+
+    names = {f.name for f in fields(EntityPayload)}
+    assert "aliases" not in names, (
+        "EntityPayload.aliases reintroduces primary-data mutation (R16 violation) — "
+        "aliases must stay derived"
+    )

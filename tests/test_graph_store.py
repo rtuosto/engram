@@ -25,7 +25,15 @@ from engram.ingestion.schema import (
 
 
 def _make_store() -> GraphStore:
-    return GraphStore(conversation_id="c1")
+    return GraphStore(conversation_id="__instance__")
+
+
+def _entity(name: str) -> EntityPayload:
+    return EntityPayload(canonical_form=name, entity_type="X")
+
+
+def _turn(memory_id: str) -> TurnPayload:
+    return TurnPayload(memory_id=memory_id, text="t", speaker="u", timestamp=None)
 
 
 def test_add_node_then_merge_labels() -> None:
@@ -35,8 +43,6 @@ def test_add_node_then_merge_labels() -> None:
         predicate="like",
         object_id=None,
         object_literal="food",
-        asserted_by_turn_id="turn_id",
-        asserted_at=None,
         modality="asserted",
         tense="present",
     )
@@ -45,8 +51,6 @@ def test_add_node_then_merge_labels() -> None:
         polarity="likes",
         target_id=None,
         target_literal="food",
-        source_claim_id="claim1",
-        confidence=0.5,
     )
     store.add_node("n1", labels=frozenset({LABEL_CLAIM}), payloads={LABEL_CLAIM: claim})
     # Second call unions labels and attaches preference payload.
@@ -64,7 +68,7 @@ def test_nodes_by_label_is_sorted() -> None:
         store.add_node(
             name,
             labels=frozenset({LABEL_ENTITY}),
-            payloads={LABEL_ENTITY: EntityPayload(canonical_form=name, entity_type="X", aliases=(name,))},
+            payloads={LABEL_ENTITY: _entity(name)},
         )
     assert store.nodes_by_label(LABEL_ENTITY) == ["alpha", "kappa", "mu", "zeta"]
     assert store.nodes_by_label(LABEL_TURN) == []
@@ -75,7 +79,7 @@ def test_add_edge_rejects_missing_endpoint() -> None:
     store.add_node(
         "a",
         labels=frozenset({LABEL_ENTITY}),
-        payloads={LABEL_ENTITY: EntityPayload(canonical_form="a", entity_type="X", aliases=("a",))},
+        payloads={LABEL_ENTITY: _entity("a")},
     )
     with pytest.raises(NodeNotFoundError):
         store.add_edge("a", "missing", EdgeAttrs(type=EDGE_ABOUT))
@@ -86,12 +90,12 @@ def test_parallel_edge_types_allowed() -> None:
     store.add_node(
         "a",
         labels=frozenset({LABEL_TURN}),
-        payloads={LABEL_TURN: TurnPayload(speaker="u", text="t", conversation_id="c1", session_index=1, turn_index=1, timestamp=None)},
+        payloads={LABEL_TURN: _turn("m")},
     )
     store.add_node(
         "b",
         labels=frozenset({LABEL_ENTITY}),
-        payloads={LABEL_ENTITY: EntityPayload(canonical_form="b", entity_type="X", aliases=("b",))},
+        payloads={LABEL_ENTITY: _entity("b")},
     )
     store.add_edge("a", "b", EdgeAttrs(type=EDGE_MENTIONS))
     store.add_edge("a", "b", EdgeAttrs(type=EDGE_ABOUT))
@@ -104,12 +108,12 @@ def test_freeze_blocks_writes() -> None:
     store.add_node(
         "a",
         labels=frozenset({LABEL_ENTITY}),
-        payloads={LABEL_ENTITY: EntityPayload(canonical_form="a", entity_type="X", aliases=("a",))},
+        payloads={LABEL_ENTITY: _entity("a")},
     )
     store.freeze()
     assert store.frozen is True
     with pytest.raises(GraphFrozenError):
-        store.add_node("b", labels=frozenset({LABEL_ENTITY}), payloads={LABEL_ENTITY: EntityPayload(canonical_form="b", entity_type="X", aliases=("b",))})
+        store.add_node("b", labels=frozenset({LABEL_ENTITY}), payloads={LABEL_ENTITY: _entity("b")})
 
 
 def test_out_edges_are_sorted() -> None:
@@ -117,13 +121,13 @@ def test_out_edges_are_sorted() -> None:
     store.add_node(
         "src",
         labels=frozenset({LABEL_TURN}),
-        payloads={LABEL_TURN: TurnPayload(speaker="u", text="t", conversation_id="c1", session_index=1, turn_index=1, timestamp=None)},
+        payloads={LABEL_TURN: _turn("m")},
     )
     for name in ["zulu", "alpha", "mike"]:
         store.add_node(
             name,
             labels=frozenset({LABEL_ENTITY}),
-            payloads={LABEL_ENTITY: EntityPayload(canonical_form=name, entity_type="X", aliases=(name,))},
+            payloads={LABEL_ENTITY: _entity(name)},
         )
         store.add_edge("src", name, EdgeAttrs(type=EDGE_MENTIONS))
 
@@ -138,7 +142,7 @@ def test_bfs_propagates_scores() -> None:
         store.add_node(
             name,
             labels=frozenset({LABEL_ENTITY}),
-            payloads={LABEL_ENTITY: EntityPayload(canonical_form=name, entity_type="X", aliases=(name,))},
+            payloads={LABEL_ENTITY: _entity(name)},
         )
     store.add_edge("seed", "hop1", EdgeAttrs(type=EDGE_MENTIONS, weight=0.5))
     store.add_edge("hop1", "hop2", EdgeAttrs(type=EDGE_MENTIONS, weight=0.5))
@@ -159,7 +163,7 @@ def test_bfs_respects_edge_type_whitelist() -> None:
         store.add_node(
             name,
             labels=frozenset({LABEL_ENTITY}),
-            payloads={LABEL_ENTITY: EntityPayload(canonical_form=name, entity_type="X", aliases=(name,))},
+            payloads={LABEL_ENTITY: _entity(name)},
         )
     store.add_edge("seed", "via_mentions", EdgeAttrs(type=EDGE_MENTIONS, weight=1.0))
     store.add_edge("seed", "via_about", EdgeAttrs(type=EDGE_ABOUT, weight=1.0))
@@ -178,14 +182,14 @@ def test_bfs_frontier_cap_is_deterministic() -> None:
     store.add_node(
         "seed",
         labels=frozenset({LABEL_ENTITY}),
-        payloads={LABEL_ENTITY: EntityPayload(canonical_form="seed", entity_type="X", aliases=("seed",))},
+        payloads={LABEL_ENTITY: _entity("seed")},
     )
     # Create 5 equal-weight neighbors; cap at 2.
     for name in ("a", "b", "c", "d", "e"):
         store.add_node(
             name,
             labels=frozenset({LABEL_ENTITY}),
-            payloads={LABEL_ENTITY: EntityPayload(canonical_form=name, entity_type="X", aliases=(name,))},
+            payloads={LABEL_ENTITY: _entity(name)},
         )
         store.add_edge("seed", name, EdgeAttrs(type=EDGE_MENTIONS, weight=1.0))
 

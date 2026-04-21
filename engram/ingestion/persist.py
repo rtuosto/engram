@@ -1,16 +1,17 @@
 """Schema-versioned msgpack persistence for a ``GraphStore``.
 
-See ``docs/design/ingestion.md §1`` and the R12 contract (§2): every persisted
-file carries an explicit ``schema_version``; load paths handle missing / old /
-future versions with a clear error, not a silent crash.
+See ``docs/design/ingestion.md §11`` and the R12 contract: every persisted
+file carries an explicit ``schema_version``; load paths handle missing /
+old / future versions with a clear error, not a silent crash.
 
 **R2 discipline.** Every iteration that influences output order is sorted
 before packing. Python 3.7+ dict iteration is insertion-ordered, so building
 dicts in sorted order yields byte-stable msgpack output.
 
-**Scope.** One conversation per file. Multi-conversation save layout is the
-:class:`engram.memory_system`-level concern (a directory of per-conversation
-files + a manifest); this module owns the single-file contract.
+**Scope.** One in-memory graph per file (one engram instance). The multi-
+file save layout (primary + embeddings + derived) is the
+:class:`engram.engram_memory_system`-level concern; this module owns the
+single-file primary contract.
 """
 
 from __future__ import annotations
@@ -28,8 +29,8 @@ from engram.ingestion.schema import (
     EntityPayload,
     EpisodePayload,
     EventPayload,
+    MemoryPayload,
     PreferencePayload,
-    SessionPayload,
     TurnPayload,
     UtteranceSegmentPayload,
 )
@@ -41,6 +42,7 @@ MEMORY_SYSTEM_ID: Final[str] = "engram_graph"
 # loader can dispatch. Adding a new payload type requires an entry here and
 # a SCHEMA_VERSION bump.
 _KIND_TO_CLS: Final[dict[str, type]] = {
+    "memory": MemoryPayload,
     "turn": TurnPayload,
     "utterance_segment": UtteranceSegmentPayload,
     "entity": EntityPayload,
@@ -48,7 +50,6 @@ _KIND_TO_CLS: Final[dict[str, type]] = {
     "preference": PreferencePayload,
     "event": EventPayload,
     "episode": EpisodePayload,
-    "session": SessionPayload,
     "edge_attrs": EdgeAttrs,
 }
 _CLS_TO_KIND: Final[dict[type, str]] = {cls: kind for kind, cls in _KIND_TO_CLS.items()}

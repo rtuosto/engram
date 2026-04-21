@@ -1,23 +1,26 @@
 """``EngramGraphMemorySystem`` — the concrete :class:`MemorySystem` implementation.
 
-Implements ingestion in Tier-1 scope per ``docs/design/ingestion.md``.
-Recall (:meth:`answer_question`) is a separate design-doc iteration and
-raises :class:`NotImplementedError` here; external callers that only need
+Implements ingest per ``docs/design/ingestion.md``. Recall
+(:meth:`recall`) is a separate design-doc iteration and raises
+:class:`NotImplementedError` here; external callers that only need
 ingest + save-state semantics work today.
+
+**One engram instance holds one memory (``R1``).** No conversation-id
+partitioning. Isolation is the caller's responsibility (instantiate
+separately, or call :meth:`reset`).
 
 **Persistence layout** (R12, manifesto §K7):
 
 ```
 <save_path>/
-    manifest.json                       # memory_system_id, memory_version,
-                                        # schema_version, ingestion_fingerprint,
-                                        # list of conversation_ids
-    <conversation_id>.msgpack           # one per conversation
+    manifest.json     # memory_system_id, memory_version, schema_version,
+                      #   ingestion_fingerprint
+    primary.msgpack   # the GraphStore's nodes + edges
 ```
 
-``load_state`` verifies ``schema_version`` matches :data:`persist.SCHEMA_VERSION`,
-``memory_system_id`` matches this instance's id, and per-conversation files
-decode cleanly. No implicit migration.
+``load_state`` verifies ``schema_version`` matches
+:data:`persist.SCHEMA_VERSION`, ``memory_system_id`` matches this instance's
+id, and the primary file decodes cleanly. No implicit migration.
 """
 
 from __future__ import annotations
@@ -35,11 +38,11 @@ from engram.ingestion.persist import (
     dump_conversation,
     load_conversation,
 )
-from engram.ingestion.pipeline import ConversationState, IngestionPipeline
-from engram.models import AnswerResult, Session
+from engram.ingestion.pipeline import IngestionPipeline, InstanceState
+from engram.models import Memory, RecallResult
 
 MANIFEST_FILENAME: Final[str] = "manifest.json"
-CONVERSATION_SUFFIX: Final[str] = ".msgpack"
+PRIMARY_FILENAME: Final[str] = "primary.msgpack"
 
 
 class EngramGraphMemorySystem:
@@ -51,7 +54,7 @@ class EngramGraphMemorySystem:
     """
 
     memory_system_id: str = MEMORY_SYSTEM_ID
-    memory_version: str = "0.1.0"
+    memory_version: str = "0.2.0"
 
     def __init__(
         self,
@@ -61,51 +64,48 @@ class EngramGraphMemorySystem:
     ) -> None:
         self._config: MemoryConfig = config or MemoryConfig()
         self._pipeline: IngestionPipeline | None = pipeline
-        self._conversations: dict[str, ConversationState] = {}
+        self._state: InstanceState | None = None
 
     # ------------------------------------------------------------------
     # Public MemorySystem surface (R1).
     # ------------------------------------------------------------------
 
-    async def ingest_session(self, session: Session, conversation_id: str) -> None:
+    async def ingest(self, memory: Memory) -> None:
         pipeline = self._get_pipeline()
-        state = self._conversations.get(conversation_id)
-        if state is None:
-            state = pipeline.create_state(conversation_id)
-            self._conversations[conversation_id] = state
-        pipeline.ingest_session(state, session)
+        if self._state is None:
+            self._state = pipeline.create_state()
+        pipeline.ingest(self._state, memory)
 
-    async def finalize_conversation(self, conversation_id: str) -> None:
-        state = self._conversations.get(conversation_id)
-        if state is None:
-            return
-        pipeline = self._get_pipeline()
-        pipeline.finalize_conversation(state)
-
-    async def answer_question(self, question: str, conversation_id: str) -> AnswerResult:
+    async def recall(
+        self,
+        query: str,
+        *,
+        now: str | None = None,
+        timezone: str | None = None,
+        max_passages: int | None = None,
+        intent_hint: str | None = None,
+    ) -> RecallResult:
         raise NotImplementedError(
-            "Recall is a separate design-doc iteration — see docs/design/ "
-            "(pending 'recall.md'). Tier-1 ingestion ships without answer_question."
+            "Recall is landing in PR-E — see docs/design/recall.md. "
+            "This PR ships the protocol surface only."
         )
 
     async def reset(self) -> None:
-        self._conversations.clear()
+        self._state = None
 
     async def save_state(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         ingestion_fingerprint = self._config.ingestion_fingerprint()
-        conversations_sorted = sorted(self._conversations.items())
 
-        for conversation_id, state in conversations_sorted:
-            target = path / f"{conversation_id}{CONVERSATION_SUFFIX}"
-            target.write_bytes(dump_conversation(state.store))
+        if self._state is not None:
+            (path / PRIMARY_FILENAME).write_bytes(dump_conversation(self._state.store))
 
         manifest = {
             "memory_system_id": self.memory_system_id,
             "memory_version": self.memory_version,
             "schema_version": SCHEMA_VERSION,
             "ingestion_fingerprint": ingestion_fingerprint,
-            "conversation_ids": [cid for cid, _ in conversations_sorted],
+            "has_primary": self._state is not None,
         }
         (path / MANIFEST_FILENAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -129,19 +129,28 @@ class EngramGraphMemorySystem:
                 f"runtime SCHEMA_VERSION={SCHEMA_VERSION}"
             )
 
+        if not manifest.get("has_primary", False):
+            self._state = None
+            return
+
+        primary_path = path / PRIMARY_FILENAME
+        if not primary_path.exists():
+            raise PersistFormatError(
+                f"manifest declared has_primary=True but {primary_path} missing"
+            )
+
         pipeline = self._get_pipeline()
-        restored: dict[str, ConversationState] = {}
-        for conversation_id in manifest.get("conversation_ids", []):
-            target = path / f"{conversation_id}{CONVERSATION_SUFFIX}"
-            if not target.exists():
-                raise PersistFormatError(
-                    f"manifest lists {conversation_id!r} but file {target} missing"
-                )
-            store = load_conversation(target.read_bytes())
-            state = pipeline.create_state(conversation_id)
-            state.store = store
-            restored[conversation_id] = state
-        self._conversations = restored
+        store = load_conversation(primary_path.read_bytes())
+        state = pipeline.create_state()
+        state.store = store
+        # memory_index is not restored from persisted primary — the graph
+        # already reflects every ingested Memory. A follow-up ingest
+        # continues from `state.memory_index + max-observed-index`; for
+        # now we leave it at 0 since the protocol doesn't allow post-load
+        # ingestion in a well-defined way (callers either load OR ingest,
+        # not both). If mixed flows become real, we'll derive the max
+        # memory_index from the loaded graph here.
+        self._state = state
 
     # ------------------------------------------------------------------
     # Helpers (not part of the protocol surface; tests may touch them).
@@ -154,13 +163,13 @@ class EngramGraphMemorySystem:
             self._pipeline = build_default_pipeline(self._config)
         return self._pipeline
 
-    def get_state(self, conversation_id: str) -> ConversationState | None:
+    def get_state(self) -> InstanceState | None:
         """Escape hatch for diagnostics / tests — do not use from Recall."""
-        return self._conversations.get(conversation_id)
+        return self._state
 
 
 __all__ = [
-    "CONVERSATION_SUFFIX",
     "EngramGraphMemorySystem",
     "MANIFEST_FILENAME",
+    "PRIMARY_FILENAME",
 ]

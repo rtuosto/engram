@@ -23,81 +23,128 @@ from engram.ingestion.persist import (
 from engram.ingestion.schema import (
     EDGE_ABOUT,
     EDGE_ASSERTS,
+    EDGE_HOLDS_PREFERENCE,
     EDGE_PART_OF,
     LABEL_CLAIM,
     LABEL_ENTITY,
+    LABEL_MEMORY,
     LABEL_PREFERENCE,
     LABEL_TURN,
     ClaimPayload,
     EdgeAttrs,
     EntityPayload,
+    MemoryPayload,
     PreferencePayload,
     TurnPayload,
     claim_identity,
     entity_identity,
+    memory_identity,
     node_id,
+    preference_identity,
     turn_identity,
 )
 
 
 def _build_store() -> GraphStore:
-    store = GraphStore(conversation_id="conv_rt")
-    turn_id = node_id(turn_identity("conv_rt", 1, 1))
-    entity_id = node_id(entity_identity("alice", "PERSON"))
-    claim_id = node_id(claim_identity(entity_id, "likes", None, "spicy food", turn_id))
+    store = GraphStore(conversation_id="__instance__")
 
+    memory_id = node_id(memory_identity(1))
+    turn_id = node_id(turn_identity(memory_id))
+    alice_id = node_id(entity_identity("alice", "PERSON"))
+    user_id = node_id(entity_identity("user", "SPEAKER"))
+    claim_id = node_id(claim_identity(alice_id, "like", None, "spicy food"))
+    pref_id = node_id(preference_identity(user_id, "likes", None, "spicy food"))
+
+    store.add_node(
+        memory_id,
+        labels=frozenset({LABEL_MEMORY}),
+        payloads={
+            LABEL_MEMORY: MemoryPayload(
+                memory_index=1,
+                content="Alice likes spicy food.",
+                timestamp="2026-01-01T00:00:00Z",
+                speaker="user",
+                source="conversation_turn",
+                metadata=(),
+            )
+        },
+    )
     store.add_node(
         turn_id,
         labels=frozenset({LABEL_TURN}),
         payloads={
             LABEL_TURN: TurnPayload(
-                speaker="user",
+                memory_id=memory_id,
                 text="Alice likes spicy food.",
-                conversation_id="conv_rt",
-                session_index=1,
-                turn_index=1,
+                speaker="user",
                 timestamp="2026-01-01T00:00:00Z",
             )
         },
     )
     store.add_node(
-        entity_id,
+        alice_id,
         labels=frozenset({LABEL_ENTITY}),
         payloads={
-            LABEL_ENTITY: EntityPayload(
-                canonical_form="alice",
-                entity_type="PERSON",
-                aliases=("Alice",),
-            )
+            LABEL_ENTITY: EntityPayload(canonical_form="alice", entity_type="PERSON")
         },
     )
-    claim_payload = ClaimPayload(
-        subject_id=entity_id,
-        predicate="like",
-        object_id=None,
-        object_literal="spicy food",
-        asserted_by_turn_id=turn_id,
-        asserted_at="2026-01-01T00:00:00Z",
-        modality="asserted",
-        tense="present",
-    )
-    pref_payload = PreferencePayload(
-        holder_id=entity_id,
-        polarity="likes",
-        target_id=None,
-        target_literal="spicy food",
-        source_claim_id=claim_id,
-        confidence=0.42,
+    store.add_node(
+        user_id,
+        labels=frozenset({LABEL_ENTITY}),
+        payloads={
+            LABEL_ENTITY: EntityPayload(canonical_form="user", entity_type="SPEAKER")
+        },
     )
     store.add_node(
         claim_id,
-        labels=frozenset({LABEL_CLAIM, LABEL_PREFERENCE}),
-        payloads={LABEL_CLAIM: claim_payload, LABEL_PREFERENCE: pref_payload},
+        labels=frozenset({LABEL_CLAIM}),
+        payloads={
+            LABEL_CLAIM: ClaimPayload(
+                subject_id=alice_id,
+                predicate="like",
+                object_id=None,
+                object_literal="spicy food",
+                modality="asserted",
+                tense="present",
+            )
+        },
+    )
+    store.add_node(
+        pref_id,
+        labels=frozenset({LABEL_PREFERENCE}),
+        payloads={
+            LABEL_PREFERENCE: PreferencePayload(
+                holder_id=user_id,
+                polarity="likes",
+                target_id=None,
+                target_literal="spicy food",
+            )
+        },
     )
 
-    store.add_edge(turn_id, claim_id, EdgeAttrs(type=EDGE_ASSERTS, weight=1.0, source_turn_id=turn_id))
-    store.add_edge(claim_id, entity_id, EdgeAttrs(type=EDGE_ABOUT, weight=1.0, source_turn_id=turn_id))
-    store.add_edge(claim_id, turn_id, EdgeAttrs(type=EDGE_PART_OF, weight=1.0))
+    store.add_edge(
+        turn_id, memory_id,
+        EdgeAttrs(type=EDGE_PART_OF, weight=1.0, source_memory_id=memory_id, source_turn_id=turn_id),
+    )
+    store.add_edge(
+        turn_id, claim_id,
+        EdgeAttrs(
+            type=EDGE_ASSERTS, weight=1.0, source_memory_id=memory_id, source_turn_id=turn_id,
+            asserted_at="2026-01-01T00:00:00Z",
+        ),
+    )
+    store.add_edge(
+        claim_id, alice_id,
+        EdgeAttrs(type=EDGE_ABOUT, weight=1.0, source_memory_id=memory_id, source_turn_id=turn_id),
+    )
+    store.add_edge(
+        user_id, pref_id,
+        EdgeAttrs(
+            type=EDGE_HOLDS_PREFERENCE, weight=0.42,
+            source_memory_id=memory_id, source_turn_id=turn_id,
+            asserted_at="2026-01-01T00:00:00Z",
+        ),
+    )
     return store
 
 

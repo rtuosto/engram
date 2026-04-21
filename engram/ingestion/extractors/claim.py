@@ -144,17 +144,17 @@ def _tense(verb: object) -> str:
 
 def extract_claims_from_sentence(
     sent: object,
-    turn_id: str,
     speaker_entity_id: str | None,
     mentions: list[ResolvedMention],
-    asserted_at: str | None,
     *,
     subject_required: bool,
 ) -> list[tuple[str, ClaimPayload]]:
     """Extract claims from one spaCy sentence span.
 
     Returns sorted ``(claim_node_id, payload)`` pairs — deterministic under
-    any caller iteration order.
+    any caller iteration order. Claim identity is ``(subject, predicate,
+    object)`` — provenance (turn / memory / timestamp) lives on the
+    ``asserts`` edge, not on the Claim node (R16).
     """
     root = getattr(sent, "root", None)
     if root is None:
@@ -208,7 +208,6 @@ def extract_claims_from_sentence(
             predicate=predicate,
             object_id=object_id,
             object_literal=object_literal,
-            asserted_by_turn_id=turn_id,
         )
     )
     payload = ClaimPayload(
@@ -216,8 +215,6 @@ def extract_claims_from_sentence(
         predicate=predicate,
         object_id=object_id,
         object_literal=object_literal,
-        asserted_by_turn_id=turn_id,
-        asserted_at=asserted_at,
         modality=modality,
         tense=tense,
     )
@@ -226,11 +223,9 @@ def extract_claims_from_sentence(
 
 def extract_claims_from_doc(
     doc: object,
-    turn_id: str,
     speaker_entity_id: str | None,
     mentions: list[EntityMention],
     entity_id_by_span: dict[tuple[int, int], str],
-    asserted_at: str | None,
     *,
     subject_required: bool,
 ) -> list[tuple[str, ClaimPayload]]:
@@ -249,10 +244,8 @@ def extract_claims_from_doc(
         claims.extend(
             extract_claims_from_sentence(
                 sent,
-                turn_id=turn_id,
                 speaker_entity_id=speaker_entity_id,
                 mentions=resolved_mentions,
-                asserted_at=asserted_at,
                 subject_required=subject_required,
             )
         )
