@@ -37,6 +37,7 @@ LABEL_NGRAM: Final[str] = "ngram"
 LABEL_ENTITY: Final[str] = "entity"
 LABEL_CLAIM: Final[str] = "claim"
 LABEL_PREFERENCE: Final[str] = "preference"
+LABEL_TIME_ANCHOR: Final[str] = "time_anchor"
 LABEL_EVENT: Final[str] = "event"
 LABEL_EPISODE: Final[str] = "episode"
 
@@ -48,6 +49,7 @@ ALL_NODE_LABELS: Final[frozenset[str]] = frozenset({
     LABEL_ENTITY,
     LABEL_CLAIM,
     LABEL_PREFERENCE,
+    LABEL_TIME_ANCHOR,
     LABEL_EVENT,
     LABEL_EPISODE,
 })
@@ -97,12 +99,15 @@ EDGE_MENTIONS: Final[str] = "mentions"
 EDGE_ASSERTS: Final[str] = "asserts"
 EDGE_HOLDS_PREFERENCE: Final[str] = "holds_preference"
 EDGE_ABOUT: Final[str] = "about"
+EDGE_TEMPORAL_AT: Final[str] = "temporal_at"
+
+# Derived edge types (emitted by :mod:`engram.ingestion.derived`, not the
+# ingest pipeline). ``temporal_before`` / ``temporal_after`` chain the
+# TimeAnchors in sorted-ISO order; ``co_occurs_with`` links Entity pairs
+# mentioned together under a shared Memory. In PR-D these live in sidecar
+# indexes rather than the graph itself (see ``derived.py``).
 EDGE_TEMPORAL_BEFORE: Final[str] = "temporal_before"
 EDGE_TEMPORAL_AFTER: Final[str] = "temporal_after"
-
-# Derived edges (emitted by the derived-rebuild pass, not the pipeline).
-# Defined here so the schema surface stays unified even though the pipeline
-# does not produce them in this PR.
 EDGE_CO_OCCURS_WITH: Final[str] = "co_occurs_with"
 
 TIER_1_EDGE_TYPES: Final[frozenset[str]] = frozenset({
@@ -111,8 +116,7 @@ TIER_1_EDGE_TYPES: Final[frozenset[str]] = frozenset({
     EDGE_ASSERTS,
     EDGE_HOLDS_PREFERENCE,
     EDGE_ABOUT,
-    EDGE_TEMPORAL_BEFORE,
-    EDGE_TEMPORAL_AFTER,
+    EDGE_TEMPORAL_AT,
 })
 
 # ---------------------------------------------------------------------------
@@ -273,6 +277,20 @@ class PreferencePayload:
 
 
 @dataclass(frozen=True, slots=True)
+class TimeAnchorPayload:
+    """A shared temporal reference for granules + relationships (``§3``).
+
+    Content-addressed by the ISO-8601 timestamp *rounded* to the configured
+    resolution (see :data:`engram.config.MemoryConfig.time_anchor_resolution`).
+    Multiple observations that share a rounded timestamp converge onto one
+    anchor; recall walks these anchors to answer "everything observed in
+    March" or "relationships established before this memory."
+    """
+
+    iso_timestamp: str  # rounded to configured resolution
+
+
+@dataclass(frozen=True, slots=True)
 class EventPayload:
     """Tier 2 — not extracted in this PR. Shape declared for schema completeness."""
 
@@ -310,6 +328,11 @@ class EdgeAttrs:
     traces to exactly one Memory. ``source_turn_id`` is retained as the
     most-specific granule ID that generated the edge (Turn, Sentence, or
     N-gram in future PRs).
+
+    ``surface_form`` is the raw pre-canonicalization text span that generated
+    this observation — populated on ``mentions`` edges so the derived
+    alias-set rebuild (PR-D) can walk entity-inbound mentions and collect
+    distinct surface forms without replaying the NER stage.
     """
 
     type: str
@@ -317,6 +340,7 @@ class EdgeAttrs:
     source_memory_id: str | None = None
     source_turn_id: str | None = None
     asserted_at: str | None = None
+    surface_form: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -407,3 +431,82 @@ def preference_identity(
         "target_id": target_id,
         "target_literal": target_literal,
     }
+
+
+def time_anchor_identity(iso_timestamp: str) -> dict[str, object]:
+    """TimeAnchor identity — one node per distinct rounded ISO timestamp.
+
+    The caller is responsible for rounding to the configured resolution
+    (:func:`round_iso_timestamp`). Two Memories that share the same rounded
+    timestamp converge onto one anchor; recall walks anchors to group "all
+    observations at this moment in time."
+    """
+    return {
+        "type": LABEL_TIME_ANCHOR,
+        "iso_timestamp": iso_timestamp,
+    }
+
+
+# ---------------------------------------------------------------------------
+# TimeAnchor resolution.
+# ---------------------------------------------------------------------------
+
+TIME_ANCHOR_RESOLUTION_SECOND: Final[str] = "second"
+TIME_ANCHOR_RESOLUTION_MINUTE: Final[str] = "minute"
+TIME_ANCHOR_RESOLUTION_HOUR: Final[str] = "hour"
+TIME_ANCHOR_RESOLUTION_DAY: Final[str] = "day"
+
+ALL_TIME_ANCHOR_RESOLUTIONS: Final[frozenset[str]] = frozenset({
+    TIME_ANCHOR_RESOLUTION_SECOND,
+    TIME_ANCHOR_RESOLUTION_MINUTE,
+    TIME_ANCHOR_RESOLUTION_HOUR,
+    TIME_ANCHOR_RESOLUTION_DAY,
+})
+
+
+def round_iso_timestamp(iso_timestamp: str, resolution: str) -> str:
+    """Round an ISO-8601 timestamp to the configured resolution.
+
+    Accepts the subset of ISO-8601 the ingest API accepts (
+    ``YYYY-MM-DDTHH:MM:SS[.ffffff][Z|±HH:MM]``). The output preserves the
+    original timezone suffix where possible.
+
+    Unrecognized formats raise :class:`ValueError` — ingest upstream should
+    fail closed on malformed timestamps before they reach this function.
+    """
+    if resolution not in ALL_TIME_ANCHOR_RESOLUTIONS:
+        raise ValueError(
+            f"unknown time_anchor_resolution={resolution!r}; "
+            f"expected one of {sorted(ALL_TIME_ANCHOR_RESOLUTIONS)}"
+        )
+
+    from datetime import datetime
+
+    # Normalize a trailing "Z" to "+00:00" for fromisoformat; preserve the
+    # exact suffix the caller supplied so anchors with offsets aren't
+    # silently renormalized to UTC.
+    suffix = ""
+    body = iso_timestamp
+    if body.endswith("Z"):
+        body = body[:-1] + "+00:00"
+        suffix = "Z"
+    try:
+        dt = datetime.fromisoformat(body)
+    except ValueError as exc:
+        raise ValueError(
+            f"cannot round non-ISO-8601 timestamp {iso_timestamp!r}: {exc}"
+        ) from exc
+
+    if resolution == TIME_ANCHOR_RESOLUTION_DAY:
+        dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif resolution == TIME_ANCHOR_RESOLUTION_HOUR:
+        dt = dt.replace(minute=0, second=0, microsecond=0)
+    elif resolution == TIME_ANCHOR_RESOLUTION_MINUTE:
+        dt = dt.replace(second=0, microsecond=0)
+    else:  # second
+        dt = dt.replace(microsecond=0)
+
+    rendered = dt.isoformat()
+    if suffix == "Z" and rendered.endswith("+00:00"):
+        rendered = rendered[: -len("+00:00")] + "Z"
+    return rendered

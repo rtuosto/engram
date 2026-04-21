@@ -49,6 +49,11 @@ class MemoryConfig:
     claim_subject_required: bool = True
     ngram_min_tokens: int = 2
     random_seed: int = 0
+    # Rounding granularity for TimeAnchor node identity (PR-D).
+    # One of "second" | "minute" | "hour" | "day". Coarser resolutions
+    # collapse more observations onto the same anchor, trading precision for
+    # a smaller temporal layer.
+    time_anchor_resolution: str = "second"
 
     # --- Answer fields ----------------------------------------------------
     answerer_model: str = "ollama:llama3.1:8b"
@@ -67,6 +72,7 @@ class MemoryConfig:
         "claim_subject_required",
         "ngram_min_tokens",
         "random_seed",
+        "time_anchor_resolution",
     })
     _ANSWER_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "answerer_model",
