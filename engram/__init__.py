@@ -11,11 +11,13 @@ consumes engram through the :class:`engram.MemorySystem` protocol — the only
 public surface external callers touch.
 """
 
+from engram.engram_memory_system import EngramGraphMemorySystem
 from engram.memory_system import MemorySystem
 from engram.models import AnswerResult, RetrievedNode, Session, Turn
 
 __all__ = [
     "AnswerResult",
+    "EngramGraphMemorySystem",
     "MemorySystem",
     "RetrievedNode",
     "Session",

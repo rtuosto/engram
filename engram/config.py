@@ -32,6 +32,8 @@ import json
 from dataclasses import asdict, dataclass, fields
 from typing import ClassVar
 
+from engram.ingestion.preferences import SEED_HASH as _PREFERENCE_SEED_HASH
+
 
 @dataclass(frozen=True, slots=True)
 class MemoryConfig:
@@ -40,6 +42,12 @@ class MemoryConfig:
     # --- Ingestion fields -------------------------------------------------
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     spacy_model: str = "en_core_web_sm"
+    preference_embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
+    preference_seed_hash: str = _PREFERENCE_SEED_HASH
+    canonicalization_match_threshold: float = 0.85
+    preference_discrimination_margin: float = 0.05
+    claim_subject_required: bool = True
+    random_seed: int = 0
 
     # --- Answer fields ----------------------------------------------------
     answerer_model: str = "ollama:llama3.1:8b"
@@ -51,6 +59,12 @@ class MemoryConfig:
     _INGESTION_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "embedding_model",
         "spacy_model",
+        "preference_embedding_model",
+        "preference_seed_hash",
+        "canonicalization_match_threshold",
+        "preference_discrimination_margin",
+        "claim_subject_required",
+        "random_seed",
     })
     _ANSWER_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "answerer_model",

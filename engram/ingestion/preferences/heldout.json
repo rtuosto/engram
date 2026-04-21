@@ -1,0 +1,56 @@
+{
+  "likes": [
+    "I find sushi absolutely delightful",
+    "I'm fond of long train rides",
+    "I really enjoy board game nights",
+    "I'm a huge fan of independent bookstores",
+    "I love waking up to bird sounds",
+    "Matcha tea is my favorite",
+    "I adore summer thunderstorms"
+  ],
+  "dislikes": [
+    "I really can't stand strong perfume",
+    "I find noisy open offices miserable",
+    "I dislike bitter IPAs",
+    "I hate writing status reports",
+    "I'm not into competitive sports at all",
+    "Reality singing shows exhaust me",
+    "I find drafty rooms unbearable"
+  ],
+  "wants": [
+    "I want to learn to play piano",
+    "I'd love an espresso machine at home",
+    "I'd like a proper office chair",
+    "I wish there was a quiet library nearby",
+    "I really want to visit the Grand Canyon",
+    "I'd love a reliable raincoat",
+    "I want to get into pottery this year"
+  ],
+  "avoids": [
+    "I never go to the grocery store on Saturdays",
+    "I avoid checking email before breakfast",
+    "I don't eat anything with cilantro",
+    "I keep clear of downtown on Fridays",
+    "I steer away from drinks with tonic water",
+    "I refuse to take red-eye flights — too exhausting",
+    "I always avoid the exercise bike at the gym"
+  ],
+  "commits_to": [
+    "I'll drive you to the airport on Monday",
+    "I'm doing the taxes tonight no matter what",
+    "I plan to wake up at six every day next week",
+    "I'm going to cancel the subscription this afternoon",
+    "I'll meet the landlord on Wednesday at noon",
+    "I will finish reading that novel this weekend",
+    "I'm attending the team dinner on Thursday"
+  ],
+  "rejects": [
+    "I absolutely will not pay that fee",
+    "No chance I'm going ice skating",
+    "I refuse to use video calls before ten",
+    "I'm not eating anchovies, full stop",
+    "I won't lend out that book again",
+    "I decline to take on any more projects",
+    "I'm not driving there in that weather"
+  ]
+}

@@ -3,12 +3,17 @@
 **Responsibility.** Convert a conversation stream into a populated graph with a
 deterministic fingerprint.
 
-**Public verbs.** ``ingest_session``, ``finalize_conversation``, ``export_state``,
-``import_state``, ``fingerprint``.
+**Public surface.** Reached via :class:`engram.EngramGraphMemorySystem`, which
+implements the ``MemorySystem`` protocol verbs (``ingest_session``,
+``finalize_conversation``, ``save_state``, ``load_state``, ``reset``). Interior
+modules — :mod:`.graph`, :mod:`.persist`, :mod:`.pipeline`, :mod:`.schema`,
+:mod:`.extractors`, :mod:`.preferences` — are not part of the external contract.
 
-**Owns.** Segmentation, NER, entity canonicalization, claim / preference / event
-extraction, temporal resolution, edge construction, episode detection,
-corpus-signal derivation, ingestion fingerprinting.
+**Owns (Tier 1).** Segmentation, NER, entity canonicalization, claim + preference
+extraction, temporal + co-occurrence edges, ingestion fingerprinting. Event /
+Episode extraction and Tier-3 semantic edges (``supports`` / ``contradicts`` /
+``refers_back_to``) are deferred to later design-doc iterations — see
+``docs/design/ingestion.md §2``.
 
 **Does not touch.** Query text, answer generation, benchmark orchestration (lives
 in the external ``agent-memory-benchmark`` repo), judge prompts, cache file layout.
