@@ -52,6 +52,7 @@ async def _run(
     max_passages: int | None,
     intent_hint: str | None,
     as_json: bool,
+    html_path: Path | None,
 ) -> None:
     system = EngramGraphMemorySystem(MemoryConfig())
 
@@ -72,6 +73,13 @@ async def _run(
         intent_hint=intent_hint,
     )
 
+    if html_path is not None:
+        from engram.diagnostics import render_trace_html
+
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.write_text(render_trace_html(trace), encoding="utf-8")
+        print(f"dashboard: {html_path}")
+
     if as_json:
         payload = {
             "query": query,
@@ -85,7 +93,7 @@ async def _run(
             "trace": trace.to_dict(),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
+    elif html_path is None:
         print(trace.pretty())
         # Also a result-line summary so stdout is useful by itself.
         print()
@@ -123,6 +131,16 @@ def main() -> None:
         action="store_true",
         help="Emit trace as JSON (for programmatic consumption).",
     )
+    parser.add_argument(
+        "--html",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write a self-contained HTML dashboard to PATH. Single file, "
+            "inline CSS+JS, no server required — open directly in a browser."
+        ),
+    )
     args = parser.parse_args()
 
     asyncio.run(
@@ -135,6 +153,7 @@ def main() -> None:
             max_passages=args.max_passages,
             intent_hint=args.intent_hint,
             as_json=args.json,
+            html_path=args.html,
         )
     )
 
