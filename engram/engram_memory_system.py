@@ -55,6 +55,9 @@ from engram.models import Memory, RecallResult
 from engram.recall.context import RecallContext
 from engram.recall.pipeline import RecallPipeline
 
+if False:  # TYPE_CHECKING — avoid circular import at runtime
+    from engram.diagnostics.recall_trace import RecallTrace as RecallTrace  # noqa: F401
+
 MANIFEST_FILENAME: Final[str] = "manifest.json"
 PRIMARY_FILENAME: Final[str] = "primary.msgpack"
 EMBEDDINGS_FILENAME: Final[str] = "embeddings.npy"
@@ -141,6 +144,47 @@ class EngramGraphMemorySystem:
 
     async def reset(self) -> None:
         self._state = None
+
+    async def recall_trace(
+        self,
+        query: str,
+        *,
+        now: str | None = None,
+        timezone: str | None = None,
+        max_passages: int | None = None,
+        intent_hint: str | None = None,
+    ) -> tuple[RecallResult, "RecallTrace"]:
+        """Run :meth:`recall` with full per-stage event capture.
+
+        Diagnostic-only surface (not on the :class:`MemorySystem` protocol).
+        Returns the same :class:`RecallResult` :meth:`recall` would plus a
+        :class:`engram.diagnostics.RecallTrace` recording intent cosines,
+        per-granularity seeds, entity-anchored seeds, BFS frontiers and
+        per-edge-type counts at each depth, granule bucket resolution, and
+        fact assembly.
+
+        The production :meth:`recall` path is unchanged — tracing replicates
+        the pipeline stages in :mod:`engram.diagnostics.recall_trace`. R2 /
+        R3 / R4 fingerprint discipline is untouched.
+        """
+        from engram.diagnostics.recall_trace import RecallTrace, traced_recall
+
+        if self._state is None:
+            empty = RecallResult(passages=(), intent=None, intent_confidence=0.0)
+            # No state yet — return a skeletal trace that still names the
+            # query so downstream tooling doesn't crash on missing fields.
+            raise RuntimeError(
+                "recall_trace called before any ingest; state is empty. "
+                "Ingest at least one Memory or call load_state first."
+            )
+        pipeline = self._get_recall_pipeline()
+        context = RecallContext(
+            now=now,
+            timezone=timezone,
+            max_passages=max_passages,
+            intent_hint=intent_hint,
+        )
+        return traced_recall(pipeline, self._state, query, context)
 
     def rebuild_derived(self) -> DerivedIndex | None:
         """Rebuild the derived-index snapshot and cache it on ``InstanceState``.
