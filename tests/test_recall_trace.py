@@ -202,3 +202,48 @@ def test_trace_pretty_output_runs() -> None:
     text = trace.pretty()
     for marker in ("[1] INTENT", "[2] SEED", "[3] EXPAND", "[4] SCORE", "[5] ASSEMBLE"):
         assert marker in text
+
+
+def test_trace_render_html_self_contained() -> None:
+    """HTML dashboard renders as a complete, self-contained document.
+
+    The artifact is supposed to be shareable — no external fetches, JSON
+    embedded inline, and all five stage containers present so the
+    rendered dashboard has everything it needs to paint without a server.
+    """
+    from engram.diagnostics import render_trace_html
+
+    system, pipeline = _ingested_system()
+    state = system.get_state()
+    assert state is not None
+    _, trace = traced_recall(
+        pipeline, state, "What does Alice like?", RecallContext()
+    )
+
+    doc = render_trace_html(trace)
+
+    # Skeleton sanity
+    assert doc.startswith("<!DOCTYPE html>")
+    assert "</html>" in doc
+
+    # No external dependencies — everything inline
+    lowered = doc.lower()
+    assert "<script src=" not in lowered
+    assert "<link rel=\"stylesheet\"" not in lowered
+
+    # Trace JSON embedded
+    assert 'id="trace-data"' in doc
+    assert trace.intent.chosen in doc or trace.intent.fallback_intent in doc
+
+    # All five stage containers rendered (tab buttons present)
+    for stage in ("intent", "seed", "expand", "score", "assemble"):
+        assert f'data-stage="{stage}"' in doc
+        assert f'id="stage-{stage}"' in doc
+
+    # BFS step controls present
+    assert 'id="bfs-range"' in doc
+    assert 'id="bfs-prev"' in doc
+    assert 'id="bfs-next"' in doc
+
+    # Query is included in the header (HTML-escaped)
+    assert "What does Alice like?" in doc

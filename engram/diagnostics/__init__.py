@@ -60,6 +60,7 @@ from engram.diagnostics.recall_trace import (
     SeedStageTrace,
     traced_recall,
 )
+from engram.diagnostics.recall_trace_html import render_html as render_trace_html
 
 __all__ = [
     "DEFAULT_PARTIAL_THRESHOLD",
@@ -86,5 +87,6 @@ __all__ = [
     "extraction_coverage",
     "fingerprint_audit",
     "needle_overlap",
+    "render_trace_html",
     "traced_recall",
 ]
